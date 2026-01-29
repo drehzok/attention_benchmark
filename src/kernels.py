@@ -62,21 +62,24 @@ def _fused_kernel(scalars_ref, x_ref, w_ref, bias_ref, gamma_ref, beta_ref,
     alpha = scalars_ref[0]
     s     = scalars_ref[1]
 
-    # Load tiles into VMEM, upcast to f32 for numerical stability.
-    # 1D params are reshaped to (1, block) before pallas_call to avoid XLA
-    # layout conflicts, so refs here are 2D and broadcast naturally over BM.
-    x_blk     = x_ref[...].astype(jnp.float32)      # (BM, BK)
-    w_blk     = w_ref[...].astype(jnp.float32)      # (BK, BN)
-    gamma_blk = gamma_ref[...].astype(jnp.float32)  # (1, BK)
-    beta_blk  = beta_ref[...].astype(jnp.float32)   # (1, BK)
-    bias_blk  = bias_ref[...].astype(jnp.float32)   # (1, BN)
+    # Load tiled inputs from VMEM.
+    x_blk = x_ref[...].astype(jnp.float32)          # (BM, BK)
+    w_blk = w_ref[...].astype(jnp.float32)          # (BK, BN)
+
+    # 1D params are passed as full arrays (block == array) to sidestep XLA
+    # layout vs Mosaic block-size conflicts.  Slice the relevant chunk here.
+    n_iter = pl.program_id(1)
+    gamma_blk = gamma_ref[pl.dslice(k_iter * _BK, _BK)].astype(jnp.float32)
+    beta_blk  = beta_ref[pl.dslice(k_iter * _BK, _BK)].astype(jnp.float32)
+    bias_blk  = bias_ref[pl.dslice(n_iter * _BN, _BN)].astype(jnp.float32)
 
     # ---- Fused Derf (runs on VPU) ----
     # Approximate erf via tanh: erf(x) ≈ tanh(2/√π · (x + 0.08943·x³))
     # lax.erf has no Pallas TPU lowering; tanh does.
     u = alpha * x_blk + s
     erf_approx = lax.tanh(_TWO_OVER_SQRT_PI * (u + _ERF_COEFF * u * u * u))
-    normed = gamma_blk * erf_approx + beta_blk      # (BM, BK)
+    normed = (gamma_blk[jnp.newaxis, :] * erf_approx
+              + beta_blk[jnp.newaxis, :])            # (BM, BK)
 
     # ---- Matrix multiply (runs on MXU) ----
     partial = lax.dot_general(
@@ -88,7 +91,7 @@ def _fused_kernel(scalars_ref, x_ref, w_ref, bias_ref, gamma_ref, beta_ref,
     # ---- Accumulate into output ----
     @pl.when(k_iter == 0)
     def _():
-        out_ref[...] = partial + bias_blk
+        out_ref[...] = partial + bias_blk[jnp.newaxis, :]
 
     @pl.when(k_iter != 0)
     def _():
@@ -103,12 +106,8 @@ def _pallas_forward(x_2d, weight, bias, alpha, s, gamma, beta):
     # Pack scalars for scalar_prefetch (loaded once into SMEM, no BlockSpec).
     scalars = jnp.array([alpha, s], dtype=jnp.float32)
 
-    # Reshape 1D params to 2D to avoid XLA layout conflicts.
-    # XLA tiles 1D arrays as T(full_size) which clashes with _BK/_BN blocks.
-    bias_2d  = bias.reshape(N // _BN, _BN)
-    gamma_2d = gamma.reshape(K // _BK, _BK)
-    beta_2d  = beta.reshape(K // _BK, _BK)
-
+    # Pass 1D params with block == array (full load) to avoid XLA layout
+    # vs Mosaic tiling conflicts.  The kernel slices the k/n chunk via dslice.
     return pl.pallas_call(
         _fused_kernel,
         out_shape=jax.ShapeDtypeStruct((M, N), jnp.float32),
@@ -117,9 +116,9 @@ def _pallas_forward(x_2d, weight, bias, alpha, s, gamma, beta):
             in_specs=[
                 pl.BlockSpec((_BM, _BK), lambda m, n, k, _: (m, k)),  # x
                 pl.BlockSpec((_BK, _BN), lambda m, n, k, _: (k, n)),  # weight
-                pl.BlockSpec((1, _BN),   lambda m, n, k, _: (n, 0)),  # bias
-                pl.BlockSpec((1, _BK),   lambda m, n, k, _: (k, 0)),  # gamma
-                pl.BlockSpec((1, _BK),   lambda m, n, k, _: (k, 0)),  # beta
+                pl.BlockSpec((N,),       lambda m, n, k, _: (0,)),     # bias  (full)
+                pl.BlockSpec((K,),       lambda m, n, k, _: (0,)),     # gamma (full)
+                pl.BlockSpec((K,),       lambda m, n, k, _: (0,)),     # beta  (full)
             ],
             out_specs=pl.BlockSpec((_BM, _BN), lambda m, n, k, _: (m, n)),
             grid=(M // _BM, N // _BN, K // _BK),
@@ -127,7 +126,7 @@ def _pallas_forward(x_2d, weight, bias, alpha, s, gamma, beta):
         compiler_params=pltpu.CompilerParams(
             dimension_semantics=("parallel", "parallel", "arbitrary"),
         ),
-    )(scalars, x_2d, weight, bias_2d, gamma_2d, beta_2d)
+    )(scalars, x_2d, weight, bias, gamma, beta)
 
 
 # ---------------------------------------------------------------------------

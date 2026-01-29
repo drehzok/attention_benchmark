@@ -24,6 +24,8 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 _MATMUL_DIMS = (((1,), (0,)), ((), ()))  # contract dim 1 of lhs with dim 0 of rhs
+_TWO_OVER_SQRT_PI = 1.1283791670955126   # 2/sqrt(pi)
+_ERF_COEFF        = 0.08943              # cubic coefficient for erf(x) approx
 
 # Block sizes — LCM of VPU (8,128) and MXU (128,128) optimal tiles.
 _BM = 128
@@ -64,9 +66,11 @@ def _fused_kernel(x_ref, w_ref, bias_ref, gamma_ref, beta_ref,
     s_blk     = s_ref[...].astype(jnp.float32)      # (BK,) broadcast scalar
 
     # ---- Fused Derf (runs on VPU) ----
-    normed = (gamma_blk[jnp.newaxis, :]
-              * lax.erf(alpha_blk[jnp.newaxis, :] * x_blk
-                        + s_blk[jnp.newaxis, :])
+    # Approximate erf via tanh: erf(x) ≈ tanh(√(2/π) · (x + 0.044715·x³))
+    # lax.erf has no Pallas TPU lowering; tanh does.
+    u = alpha_blk[jnp.newaxis, :] * x_blk + s_blk[jnp.newaxis, :]
+    erf_approx = lax.tanh(_TWO_OVER_SQRT_PI * (u + _ERF_COEFF * u * u * u))
+    normed = (gamma_blk[jnp.newaxis, :] * erf_approx
               + beta_blk[jnp.newaxis, :])            # (BM, BK)
 
     # ---- Matrix multiply (runs on MXU) ----

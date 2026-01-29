@@ -363,3 +363,117 @@ class DerfBert(nnx.Module):
         logits = self.head(x)
 
         return logits
+
+
+# ---------------------------------------------------------------------------
+# Fused Derf models (Pallas kernel fusion)
+# ---------------------------------------------------------------------------
+class FusedTransformerBlock(nnx.Module):
+    """TransformerBlock with fused Derf+Linear via Pallas kernels.
+
+    Fuses norm1+QKV and norm2+fc1 into single kernels that keep the Derf
+    intermediate in VMEM, avoiding HBM roundtrips.
+    """
+
+    def __init__(self, dim: int, num_heads: int, mlp_dim: int, dropout_rate: float, rngs: nnx.Rngs):
+        self.dim = dim
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+
+        # Attention path
+        self.norm1 = Derf(dim, rngs)
+        self.w_qkv = nnx.Linear(dim, 3 * dim, rngs=rngs)
+        self.w_o = nnx.Linear(dim, dim, rngs=rngs)
+        self.dropout1 = nnx.Dropout(dropout_rate, rngs=rngs)
+
+        # MLP path
+        self.norm2 = Derf(dim, rngs)
+        self.mlp_fc1 = nnx.Linear(dim, mlp_dim, rngs=rngs)
+        self.mlp_fc2 = nnx.Linear(mlp_dim, dim, rngs=rngs)
+        self.dropout2 = nnx.Dropout(dropout_rate, rngs=rngs)
+
+    def __call__(self, x: jax.Array, mask: jax.Array = None, deterministic: bool = False) -> jax.Array:
+        from .kernels import fused_derf_linear
+
+        batch, seq_len, dim = x.shape
+        resid = x
+
+        # Fused Derf + QKV projection
+        qkv = fused_derf_linear(
+            x,
+            self.w_qkv.kernel[...],
+            self.w_qkv.bias[...],
+            self.norm1.alpha[...],
+            self.norm1.s[...],
+            self.norm1.gamma[...],
+            self.norm1.beta[...],
+        )
+        # (batch, seq, 3*dim) -> (batch, seq, 3, heads, head_dim)
+        qkv = qkv.reshape(batch, seq_len, 3, self.num_heads, self.head_dim)
+        q, k, v = qkv[:, :, 0], qkv[:, :, 1], qkv[:, :, 2]
+
+        # Attention: expects (batch, seq, heads, head_dim)
+        attn_out = jax.nn.dot_product_attention(q, k, v, mask=mask)
+        attn_out = attn_out.reshape(batch, seq_len, dim)
+
+        x = resid + self.dropout1(self.w_o(attn_out), deterministic=deterministic)
+
+        # Fused Derf + fc1
+        resid = x
+
+        hidden = fused_derf_linear(
+            x,
+            self.mlp_fc1.kernel[...],
+            self.mlp_fc1.bias[...],
+            self.norm2.alpha[...],
+            self.norm2.s[...],
+            self.norm2.gamma[...],
+            self.norm2.beta[...],
+        )
+        hidden = jax.nn.gelu(hidden)
+        hidden = self.mlp_fc2(hidden)
+        x = resid + self.dropout2(hidden, deterministic=deterministic)
+
+        return x
+
+
+class FusedDerfBert(nnx.Module):
+    """DerfBert using FusedTransformerBlock for Pallas kernel fusion."""
+
+    def __init__(
+        self,
+        vocab_size: int,
+        num_layers: int,
+        dim: int,
+        num_heads: int,
+        mlp_dim: int,
+        dropout_rate: float,
+        rngs: nnx.Rngs,
+    ):
+        self.dim = dim
+        self.num_layers = num_layers
+
+        self.embed = nnx.Embed(vocab_size, dim, rngs=rngs)
+        self.pos_embed = nnx.Embed(512, dim, rngs=rngs)
+        self.final_norm = Derf(dim, rngs)
+
+        self.layers = nnx.List([
+            FusedTransformerBlock(dim, num_heads, mlp_dim, dropout_rate, rngs)
+            for _ in range(num_layers)
+        ])
+
+        self.head = nnx.Linear(dim, vocab_size, rngs=rngs)
+
+    def __call__(self, input_ids: jax.Array, mask: jax.Array = None, deterministic: bool = False) -> jax.Array:
+        seq_len = input_ids.shape[1]
+
+        pos_ids = jnp.arange(seq_len)[None, :]
+        x = self.embed(input_ids) + self.pos_embed(pos_ids)
+
+        for layer in self.layers:
+            x = layer(x, mask, deterministic=deterministic)
+
+        x = self.final_norm(x)
+        logits = self.head(x)
+
+        return logits

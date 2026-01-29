@@ -15,9 +15,11 @@ from src.models import (
     BertEmbeddings,
     DerfBert,
     NormalBert,
+    FusedDerfBert,
     JaxEncoderLayer,
     NaiveEncoderLayer,
 )
+from src.kernels import fused_derf_linear
 
 
 BATCH_SIZE = 2
@@ -157,3 +159,106 @@ def test_derf_vs_normal_bert_same_shape():
 
     assert derf_logits.shape == normal_logits.shape
     assert derf_logits.shape == (BATCH_SIZE, SEQ_LEN, vocab_size)
+
+
+# ---- Fused kernel tests ----
+
+
+def test_fused_derf_linear_matches_reference():
+    key = jax.random.PRNGKey(0)
+    k1, k2, k3, k4, k5 = jax.random.split(key, 5)
+
+    dim, out_dim = 64, 128
+    x = jax.random.normal(k1, (BATCH_SIZE, SEQ_LEN, dim))
+    weight = jax.random.normal(k2, (dim, out_dim))
+    bias = jax.random.normal(k3, (out_dim,))
+    alpha = jnp.array(0.5)
+    s = jnp.array(0.1)
+    gamma = jax.random.normal(k4, (dim,))
+    beta = jax.random.normal(k5, (dim,))
+
+    out_fused = fused_derf_linear(x, weight, bias, alpha, s, gamma, beta)
+
+    # Reference: derf then matmul
+    normed = gamma * jax.lax.erf(alpha * x + s) + beta
+    out_ref = normed @ weight + bias
+
+    assert out_fused.shape == (BATCH_SIZE, SEQ_LEN, out_dim)
+    assert jnp.allclose(out_fused, out_ref, atol=1e-5)
+
+
+def test_fused_derf_linear_gradient():
+    key = jax.random.PRNGKey(42)
+    k1, k2, k3, k4, k5 = jax.random.split(key, 5)
+
+    dim, out_dim = 64, 128
+    x = jax.random.normal(k1, (BATCH_SIZE, SEQ_LEN, dim))
+    weight = jax.random.normal(k2, (dim, out_dim))
+    bias = jax.random.normal(k3, (out_dim,))
+    alpha = jnp.array(0.5)
+    s = jnp.array(0.1)
+    gamma = jax.random.normal(k4, (dim,))
+    beta = jax.random.normal(k5, (dim,))
+
+    def loss_fused(x, w, b, a, s_, g, bt):
+        return fused_derf_linear(x, w, b, a, s_, g, bt).sum()
+
+    def loss_ref(x, w, b, a, s_, g, bt):
+        normed = g * jax.lax.erf(a * x + s_) + bt
+        return (normed @ w + b).sum()
+
+    grads_fused = jax.grad(loss_fused, argnums=(0, 1, 2, 3, 4, 5, 6))(
+        x, weight, bias, alpha, s, gamma, beta
+    )
+    grads_ref = jax.grad(loss_ref, argnums=(0, 1, 2, 3, 4, 5, 6))(
+        x, weight, bias, alpha, s, gamma, beta
+    )
+
+    names = ['x', 'weight', 'bias', 'alpha', 's', 'gamma', 'beta']
+    for gf, gr, name in zip(grads_fused, grads_ref, names):
+        assert jnp.allclose(gf, gr, atol=1e-4), f"Gradient mismatch for {name}"
+
+
+# ---- FusedDerfBert tests ----
+
+
+def test_fused_derf_bert_forward(rngs):
+    vocab_size = 256
+    dim = 64
+    model = FusedDerfBert(
+        vocab_size=vocab_size,
+        num_layers=2,
+        dim=dim,
+        num_heads=4,
+        mlp_dim=128,
+        dropout_rate=0.0,
+        rngs=rngs,
+    )
+
+    input_ids = jnp.ones((BATCH_SIZE, SEQ_LEN), dtype=jnp.int32)
+    logits = model(input_ids, deterministic=True)
+
+    assert logits.shape == (BATCH_SIZE, SEQ_LEN, vocab_size)
+    assert jnp.all(jnp.isfinite(logits))
+
+
+def test_fused_vs_unfused_same_shape():
+    vocab_size = 256
+    kwargs = dict(
+        vocab_size=vocab_size,
+        num_layers=2,
+        dim=64,
+        num_heads=4,
+        mlp_dim=128,
+        dropout_rate=0.0,
+    )
+
+    fused = FusedDerfBert(**kwargs, rngs=nnx.Rngs(0))
+    unfused = DerfBert(**kwargs, rngs=nnx.Rngs(0))
+
+    input_ids = jnp.ones((BATCH_SIZE, SEQ_LEN), dtype=jnp.int32)
+    out_fused = fused(input_ids, deterministic=True)
+    out_unfused = unfused(input_ids, deterministic=True)
+
+    assert out_fused.shape == out_unfused.shape
+    assert out_fused.shape == (BATCH_SIZE, SEQ_LEN, vocab_size)

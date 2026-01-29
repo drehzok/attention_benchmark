@@ -19,7 +19,7 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from src.models import DerfBert, NormalBert
+from src.models import DerfBert, NormalBert, FusedDerfBert
 from src.data import get_tokenizer, create_dataset, create_dataloader
 
 CONFIGS = {
@@ -29,8 +29,8 @@ CONFIGS = {
 
 
 def create_model(model_type, config, vocab_size, dropout_rate, rngs):
-    """Instantiate DerfBert or NormalBert based on model_type string."""
-    cls = DerfBert if model_type == "derf" else NormalBert
+    """Instantiate DerfBert, NormalBert, or FusedDerfBert based on model_type string."""
+    cls = {"derf": DerfBert, "normal": NormalBert, "fused": FusedDerfBert}[model_type]
     return cls(
         vocab_size=vocab_size,
         num_layers=config["num_layers"],
@@ -201,8 +201,8 @@ def save_checkpoint(model, optimizer, step, model_type, args):
 
 def main():
     parser = argparse.ArgumentParser(description="BERT pretraining benchmark: Derf vs LayerNorm")
-    parser.add_argument("--model", choices=["derf", "normal", "both"], default="both",
-                        help="Which model(s) to train (default: both)")
+    parser.add_argument("--model", choices=["derf", "normal", "fused", "both", "all"], default="both",
+                        help="Which model(s) to train: derf, normal, fused, both (derf+normal), all")
     parser.add_argument("--size", choices=["base", "small"], default="base",
                         help="Model size (default: base)")
     parser.add_argument("--steps", type=int, default=10000,
@@ -261,15 +261,19 @@ def main():
     print("\nLoading tokenizer...")
     tokenizer = get_tokenizer()
 
+    model_types = {
+        "derf": ["derf"],
+        "normal": ["normal"],
+        "fused": ["fused"],
+        "both": ["derf", "normal"],
+        "all": ["derf", "normal", "fused"],
+    }[args.model]
+
     results = []
+    for mt in model_types:
+        results.append(train_model(mt, args, config, tokenizer, mesh))
 
-    if args.model in ("derf", "both"):
-        results.append(train_model("derf", args, config, tokenizer, mesh))
-
-    if args.model in ("normal", "both"):
-        results.append(train_model("normal", args, config, tokenizer, mesh))
-
-    if len(results) == 2:
+    if len(results) >= 2:
         print(f"\n{'=' * 60}")
         print("COMPARISON")
         print(f"{'=' * 60}")

@@ -13,5 +13,8 @@ from .models import (
     NormalTransformerBlock,
     NormalBert,
     DerfBert,
+    FusedTransformerBlock,
+    FusedDerfBert,
 )
+from .kernels import fused_derf_linear
 from .utils import BenchmarkTimer, generate_random_inputs, setup_logger, warmup_jit

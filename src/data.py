@@ -68,12 +68,12 @@ def create_dataset(tokenizer, seq_len=128, seed=42):
     """
     from datasets import load_dataset, interleave_datasets
 
-    wiki = load_dataset("wikipedia", "20220301.en", split="train", streaming=True)
-    books = load_dataset("bookcorpusopen", split="train", streaming=True)
+    wiki = load_dataset("wikimedia/wikipedia", "20231101.en", split="train", streaming=True)
+    books = load_dataset("bookcorpusopen", split="train", streaming=True, trust_remote_code=True)
 
-    # Extract text field (wikipedia has "text", bookcorpusopen has "text")
-    wiki = wiki.map(lambda x: {"text": x["text"]}, remove_columns=wiki.column_names)
-    books = books.map(lambda x: {"text": x["text"]}, remove_columns=books.column_names)
+    # Extract text field (both have "text")
+    wiki = wiki.remove_columns([c for c in wiki.column_names if c != "text"])
+    books = books.remove_columns([c for c in books.column_names if c != "text"])
 
     combined = interleave_datasets([wiki, books], seed=seed)
     combined = combined.shuffle(seed=seed, buffer_size=10000)

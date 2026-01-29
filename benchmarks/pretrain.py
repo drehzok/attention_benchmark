@@ -236,7 +236,8 @@ def main():
 
     devices = jax.devices()
     num_devices = len(devices)
-    mesh = Mesh(jax.numpy.array(devices), axis_names=('dp',))
+    import numpy as np
+    mesh = Mesh(np.array(devices), axis_names=('dp',))
 
     if args.batch_size % num_devices != 0:
         old_bs = args.batch_size

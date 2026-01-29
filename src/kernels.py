@@ -63,19 +63,20 @@ def _fused_kernel(scalars_ref, x_ref, w_ref, bias_ref, gamma_ref, beta_ref,
     s     = scalars_ref[1]
 
     # Load tiles into VMEM, upcast to f32 for numerical stability.
+    # 1D params are reshaped to (1, block) before pallas_call to avoid XLA
+    # layout conflicts, so refs here are 2D and broadcast naturally over BM.
     x_blk     = x_ref[...].astype(jnp.float32)      # (BM, BK)
     w_blk     = w_ref[...].astype(jnp.float32)      # (BK, BN)
-    gamma_blk = gamma_ref[...].astype(jnp.float32)  # (BK,)
-    beta_blk  = beta_ref[...].astype(jnp.float32)   # (BK,)
-    bias_blk  = bias_ref[...].astype(jnp.float32)   # (BN,)
+    gamma_blk = gamma_ref[...].astype(jnp.float32)  # (1, BK)
+    beta_blk  = beta_ref[...].astype(jnp.float32)   # (1, BK)
+    bias_blk  = bias_ref[...].astype(jnp.float32)   # (1, BN)
 
     # ---- Fused Derf (runs on VPU) ----
     # Approximate erf via tanh: erf(x) ≈ tanh(2/√π · (x + 0.08943·x³))
     # lax.erf has no Pallas TPU lowering; tanh does.
     u = alpha * x_blk + s
     erf_approx = lax.tanh(_TWO_OVER_SQRT_PI * (u + _ERF_COEFF * u * u * u))
-    normed = (gamma_blk[jnp.newaxis, :] * erf_approx
-              + beta_blk[jnp.newaxis, :])            # (BM, BK)
+    normed = gamma_blk * erf_approx + beta_blk      # (BM, BK)
 
     # ---- Matrix multiply (runs on MXU) ----
     partial = lax.dot_general(
@@ -87,7 +88,7 @@ def _fused_kernel(scalars_ref, x_ref, w_ref, bias_ref, gamma_ref, beta_ref,
     # ---- Accumulate into output ----
     @pl.when(k_iter == 0)
     def _():
-        out_ref[...] = partial + bias_blk[jnp.newaxis, :]
+        out_ref[...] = partial + bias_blk
 
     @pl.when(k_iter != 0)
     def _():
@@ -102,6 +103,12 @@ def _pallas_forward(x_2d, weight, bias, alpha, s, gamma, beta):
     # Pack scalars for scalar_prefetch (loaded once into SMEM, no BlockSpec).
     scalars = jnp.array([alpha, s], dtype=jnp.float32)
 
+    # Reshape 1D params to 2D to avoid XLA layout conflicts.
+    # XLA tiles 1D arrays as T(full_size) which clashes with _BK/_BN blocks.
+    bias_2d  = bias.reshape(N // _BN, _BN)
+    gamma_2d = gamma.reshape(K // _BK, _BK)
+    beta_2d  = beta.reshape(K // _BK, _BK)
+
     return pl.pallas_call(
         _fused_kernel,
         out_shape=jax.ShapeDtypeStruct((M, N), jnp.float32),
@@ -110,9 +117,9 @@ def _pallas_forward(x_2d, weight, bias, alpha, s, gamma, beta):
             in_specs=[
                 pl.BlockSpec((_BM, _BK), lambda m, n, k, _: (m, k)),  # x
                 pl.BlockSpec((_BK, _BN), lambda m, n, k, _: (k, n)),  # weight
-                pl.BlockSpec((_BN,),     lambda m, n, k, _: (n,)),     # bias
-                pl.BlockSpec((_BK,),     lambda m, n, k, _: (k,)),     # gamma
-                pl.BlockSpec((_BK,),     lambda m, n, k, _: (k,)),     # beta
+                pl.BlockSpec((1, _BN),   lambda m, n, k, _: (n, 0)),  # bias
+                pl.BlockSpec((1, _BK),   lambda m, n, k, _: (k, 0)),  # gamma
+                pl.BlockSpec((1, _BK),   lambda m, n, k, _: (k, 0)),  # beta
             ],
             out_specs=pl.BlockSpec((_BM, _BN), lambda m, n, k, _: (m, n)),
             grid=(M // _BM, N // _BN, K // _BK),
@@ -120,7 +127,7 @@ def _pallas_forward(x_2d, weight, bias, alpha, s, gamma, beta):
         compiler_params=pltpu.CompilerParams(
             dimension_semantics=("parallel", "parallel", "arbitrary"),
         ),
-    )(scalars, x_2d, weight, bias, gamma, beta)
+    )(scalars, x_2d, weight, bias_2d, gamma_2d, beta_2d)
 
 
 # ---------------------------------------------------------------------------

@@ -45,8 +45,8 @@ def _derf_linear_ref(x, weight, bias, alpha, s, gamma, beta):
 # ---------------------------------------------------------------------------
 # Pallas forward kernel
 # ---------------------------------------------------------------------------
-def _fused_kernel(scalars_ref, gamma_ref, beta_ref, bias_ref,
-                  x_ref, w_ref, out_ref):
+def _fused_kernel(scalars_ref, x_ref, w_ref, bias_ref, gamma_ref, beta_ref,
+                  out_ref):
     """Fused derf + matmul kernel body.
 
     Each grid cell (m, n, k) computes a (BM, BN) partial result:
@@ -54,13 +54,15 @@ def _fused_kernel(scalars_ref, gamma_ref, beta_ref, bias_ref,
         partial      = normed_block @ weight[k,n]
     and accumulates into out[m, n].  Bias is added once on the first k iter.
 
-    scalars_ref, gamma_ref, beta_ref, bias_ref are scalar-prefetch refs
-    (full arrays in SMEM — no VMEM layout / alignment constraints).
+    scalars_ref: scalar-prefetch (SMEM), shape (2,): [alpha, s].
+    bias_ref, gamma_ref, beta_ref: VMEM full-array BlockSpecs (block == array).
+        Reshaped to 2D (num_blocks, block_size) to satisfy TPU alignment.
+        The kernel selects the relevant row via dynamic indexing.
     """
     k_iter = pl.program_id(2)
     n_iter = pl.program_id(1)
 
-    # Scalar prefetch — loaded once into SMEM, no tiling.
+    # Scalar prefetch — loaded once into SMEM.
     alpha = scalars_ref[0]
     s     = scalars_ref[1]
 
@@ -68,13 +70,11 @@ def _fused_kernel(scalars_ref, gamma_ref, beta_ref, bias_ref,
     x_blk = x_ref[...].astype(jnp.float32)          # (BM, BK)
     w_blk = w_ref[...].astype(jnp.float32)          # (BK, BN)
 
-    # Slice 1D params from SMEM (no VMEM layout issues).
-    gamma_blk = lax.dynamic_slice(
-        gamma_ref[...], (k_iter * _BK,), (_BK,)).astype(jnp.float32)
-    beta_blk = lax.dynamic_slice(
-        beta_ref[...], (k_iter * _BK,), (_BK,)).astype(jnp.float32)
-    bias_blk = lax.dynamic_slice(
-        bias_ref[...], (n_iter * _BN,), (_BN,)).astype(jnp.float32)
+    # 1D params stored as 2D (num_blocks, block_size) with block == array.
+    # Load full array, then dynamic-index the relevant row.
+    gamma_blk = gamma_ref[...][k_iter].astype(jnp.float32)  # (BK,)
+    beta_blk  = beta_ref[...][k_iter].astype(jnp.float32)   # (BK,)
+    bias_blk  = bias_ref[...][n_iter].astype(jnp.float32)   # (BN,)
 
     # ---- Fused Derf (runs on VPU) ----
     # Approximate erf via tanh: erf(x) ≈ tanh(2/√π · (x + 0.08943·x³))
@@ -105,27 +105,38 @@ def _pallas_forward(x_2d, weight, bias, alpha, s, gamma, beta):
     """Invoke the Pallas kernel.  x_2d: (M, K), weight: (K, N)."""
     M, K = x_2d.shape
     N = weight.shape[1]
+    k_blks = K // _BK
+    n_blks = N // _BN
 
-    # All 1D params go into scalar_prefetch (SMEM) to avoid VMEM layout
-    # and alignment constraints on 1D arrays.
+    # alpha/s as scalar_prefetch (SMEM, scalar-only loads).
     scalars = jnp.array([alpha, s], dtype=jnp.float32)
+
+    # Reshape 1D params to 2D with block == array.  When block dims equal
+    # array dims the TPU alignment rule (div by 8/128) is automatically
+    # satisfied, and XLA layout matches Mosaic layout.
+    gamma_2d = gamma.reshape(k_blks, _BK)
+    beta_2d  = beta.reshape(k_blks, _BK)
+    bias_2d  = bias.reshape(n_blks, _BN)
 
     return pl.pallas_call(
         _fused_kernel,
         out_shape=jax.ShapeDtypeStruct((M, N), jnp.float32),
         grid_spec=pltpu.PrefetchScalarGridSpec(
-            num_scalar_prefetch=4,  # scalars, gamma, beta, bias
+            num_scalar_prefetch=1,
             in_specs=[
-                pl.BlockSpec((_BM, _BK), lambda m, n, k, *_: (m, k)),  # x
-                pl.BlockSpec((_BK, _BN), lambda m, n, k, *_: (k, n)),  # weight
+                pl.BlockSpec((_BM, _BK),        lambda m, n, k, _: (m, k)),  # x
+                pl.BlockSpec((_BK, _BN),        lambda m, n, k, _: (k, n)),  # weight
+                pl.BlockSpec((n_blks, _BN),     lambda m, n, k, _: (0, 0)),  # bias  (full)
+                pl.BlockSpec((k_blks, _BK),     lambda m, n, k, _: (0, 0)),  # gamma (full)
+                pl.BlockSpec((k_blks, _BK),     lambda m, n, k, _: (0, 0)),  # beta  (full)
             ],
-            out_specs=pl.BlockSpec((_BM, _BN), lambda m, n, k, *_: (m, n)),
+            out_specs=pl.BlockSpec((_BM, _BN), lambda m, n, k, _: (m, n)),
             grid=(M // _BM, N // _BN, K // _BK),
         ),
         compiler_params=pltpu.CompilerParams(
             dimension_semantics=("parallel", "parallel", "arbitrary"),
         ),
-    )(scalars, gamma, beta, bias, x_2d, weight)
+    )(scalars, x_2d, weight, bias_2d, gamma_2d, beta_2d)
 
 
 # ---------------------------------------------------------------------------

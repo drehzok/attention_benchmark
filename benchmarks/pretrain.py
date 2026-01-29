@@ -15,6 +15,7 @@ import jax
 import jax.numpy as jnp
 import optax
 from flax import nnx
+from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
@@ -90,19 +91,32 @@ def make_train_step(model, optimizer):
     return train_step
 
 
-def train_model(model_type, args, config, tokenizer, print_prefix=""):
+def train_model(model_type, args, config, tokenizer, mesh, print_prefix=""):
     """Train a single model and return results."""
     print(f"\n{'=' * 60}")
     print(f"{print_prefix}Training {model_type.upper()} model ({args.size})")
     print(f"{'=' * 60}")
+
+    replicate = NamedSharding(mesh, P())
+    data_shard = NamedSharding(mesh, P('dp'))
 
     rngs = nnx.Rngs(args.seed)
     model = create_model(model_type, config, tokenizer.vocab_size, args.dropout, rngs)
     n_params = count_params(model)
     print(f"Parameters: {n_params:,}")
 
+    # Replicate model state across all devices
+    state = nnx.state(model)
+    state = jax.device_put(state, replicate)
+    nnx.update(model, state)
+
     tx = create_optimizer(args.lr, args.warmup_steps, args.steps, args.weight_decay)
     optimizer = nnx.Optimizer(model, tx, wrt=nnx.Param)
+
+    # Replicate optimizer state across all devices
+    opt_state = nnx.state(optimizer)
+    opt_state = jax.device_put(opt_state, replicate)
+    nnx.update(optimizer, opt_state)
 
     train_step = make_train_step(model, optimizer)
 
@@ -111,7 +125,8 @@ def train_model(model_type, args, config, tokenizer, print_prefix=""):
         dataset, args.batch_size, tokenizer, mlm_prob=args.mlm_prob, seed=args.seed
     )
 
-    print(f"Starting training for {args.steps} steps...")
+    print(f"Starting training for {args.steps} steps "
+          f"(data-parallel across {len(mesh.devices)} devices)...")
     total_tokens = 0
     start_time = time.perf_counter()
     step_times = []
@@ -120,6 +135,10 @@ def train_model(model_type, args, config, tokenizer, print_prefix=""):
     for step, (input_ids, labels) in enumerate(dataloader):
         if step >= args.steps:
             break
+
+        # Shard batch across devices along batch dimension
+        input_ids = jax.device_put(input_ids, data_shard)
+        labels = jax.device_put(labels, data_shard)
 
         step_start = time.perf_counter()
         loss = train_step(model, optimizer, input_ids, labels)
@@ -215,13 +234,24 @@ def main():
     # Multi-host TPU initialization
     jax.distributed.initialize()
 
+    devices = jax.devices()
+    num_devices = len(devices)
+    mesh = Mesh(jax.numpy.array(devices), axis_names=('dp',))
+
+    if args.batch_size % num_devices != 0:
+        old_bs = args.batch_size
+        args.batch_size = (args.batch_size // num_devices) * num_devices
+        if args.batch_size == 0:
+            args.batch_size = num_devices
+        print(f"  Adjusted batch size {old_bs} -> {args.batch_size} (divisible by {num_devices} devices)")
+
     print("BERT Pretraining Benchmark: Derf vs LayerNorm")
-    print(f"  JAX devices:   {jax.devices()}")
-    print(f"  Device count:  {jax.device_count()}")
+    print(f"  JAX devices:   {devices}")
+    print(f"  Device count:  {num_devices}")
     print(f"  Model size:    {args.size}")
     print(f"  Config:        {CONFIGS[args.size]}")
     print(f"  Steps:         {args.steps}")
-    print(f"  Batch size:    {args.batch_size}")
+    print(f"  Batch size:    {args.batch_size} ({args.batch_size // num_devices} per device)")
     print(f"  Seq length:    {args.seq_len}")
     print(f"  Learning rate: {args.lr}")
 
@@ -233,10 +263,10 @@ def main():
     results = []
 
     if args.model in ("derf", "both"):
-        results.append(train_model("derf", args, config, tokenizer))
+        results.append(train_model("derf", args, config, tokenizer, mesh))
 
     if args.model in ("normal", "both"):
-        results.append(train_model("normal", args, config, tokenizer))
+        results.append(train_model("normal", args, config, tokenizer, mesh))
 
     if len(results) == 2:
         print(f"\n{'=' * 60}")

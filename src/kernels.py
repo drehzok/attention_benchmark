@@ -1,13 +1,18 @@
 """Fused Derf normalization + linear projection via JAX Pallas kernels (TPU).
 
-The main public API is `fused_derf_linear(x, weight, bias, alpha, s, gamma, beta)`
-which computes:
-    derf_out = gamma * erf(alpha * x + s) + beta
-    return derf_out @ weight + bias
+Computes: output = (gamma * erf(alpha * x + s) + beta) @ weight + bias
 
-On TPU with sufficiently large tensors, this runs as a single Pallas kernel
-that keeps the Derf intermediate in VMEM, avoiding an HBM roundtrip.
-On CPU or for small tensors, it falls back to pure JAX ops.
+The forward pass runs as a single fused Pallas kernel on TPU that keeps the
+Derf intermediate in VMEM, avoiding an HBM round-trip.  Falls back to pure
+JAX on non-TPU backends or when shapes are not aligned to block sizes.
+
+The backward pass uses pure JAX with recomputation of intermediates.
+
+Block sizes (128, 128) are the LCM of VPU-optimal (8, 128) and MXU-optimal
+(128, 128), giving good utilisation on both processing units.
+
+erf  -> computed on VPU  (optimal tile: multiple of (8, 128))
+matmul -> computed on MXU (optimal tile: (128, 128))
 """
 
 import functools
@@ -15,96 +20,109 @@ import functools
 import jax
 import jax.numpy as jnp
 from jax import lax
+from jax.experimental import pallas as pl
+from jax.experimental.pallas import tpu as pltpu
 
-# Block sizes for TPU MXU alignment
+# Block sizes — LCM of VPU (8,128) and MXU (128,128) optimal tiles.
 _BM = 128
 _BK = 128
 _BN = 128
-_MIN_M = 128  # fallback to JAX if M < this
 
 
 # ---------------------------------------------------------------------------
-# Pure JAX reference (fallback and backward)
+# Pure JAX reference (fallback & gradient computation)
 # ---------------------------------------------------------------------------
 def _derf_linear_ref(x, weight, bias, alpha, s, gamma, beta):
-    """Pure JAX: derf(x) @ weight + bias."""
+    """Pure JAX: (gamma * erf(alpha*x + s) + beta) @ weight + bias."""
     normed = gamma * lax.erf(alpha * x + s) + beta
     return normed @ weight + bias
 
 
 # ---------------------------------------------------------------------------
-# Pallas kernel
+# Pallas forward kernel
 # ---------------------------------------------------------------------------
-def _make_kernel(alpha, s):
-    """Create kernel function with alpha/s captured via closure."""
-    def kernel(x_ref, w_ref, bias_ref, gamma_ref, beta_ref, out_ref):
-        k_iter = jax.lax.axis_index("k") if False else None  # placeholder
-        from jax.experimental import pallas as pl
+def _fused_kernel(x_ref, w_ref, bias_ref, gamma_ref, beta_ref, out_ref,
+                  *, alpha, s):
+    """Fused derf + matmul kernel body.
 
-        k_iter = pl.program_id(2)
+    Each grid cell (m, n, k) computes a (BM, BN) partial result:
+        normed_block = gamma[k] * erf(alpha * x[m,k] + s) + beta[k]
+        partial      = normed_block @ weight[k,n]
+    and accumulates into out[m, n].  Bias is added once on the first k iter.
+    """
+    k_iter = pl.program_id(2)
 
-        x_block = x_ref[...]
-        w_block = w_ref[...]
-        g_block = gamma_ref[jnp.newaxis, :]
-        b_block = beta_ref[jnp.newaxis, :]
+    # Load tiles into VMEM, upcast to f32 for numerical stability.
+    x_blk     = x_ref[...].astype(jnp.float32)      # (BM, BK)
+    w_blk     = w_ref[...].astype(jnp.float32)      # (BK, BN)
+    gamma_blk = gamma_ref[...].astype(jnp.float32)  # (BK,)
+    beta_blk  = beta_ref[...].astype(jnp.float32)   # (BK,)
+    bias_blk  = bias_ref[...].astype(jnp.float32)   # (BN,)
 
-        normed = g_block * lax.erf(alpha * x_block + s) + b_block
-        result = pl.dot(normed, w_block)
+    # ---- Fused Derf (runs on VPU) ----
+    normed = (gamma_blk[jnp.newaxis, :]
+              * lax.erf(alpha * x_blk + s)
+              + beta_blk[jnp.newaxis, :])            # (BM, BK)
 
-        @pl.when(k_iter == 0)
-        def _init():
-            out_ref[...] = jnp.broadcast_to(bias_ref[jnp.newaxis, :], result.shape) + result
+    # ---- Matrix multiply (runs on MXU) ----
+    partial = lax.dot_general(
+        normed, w_blk,
+        dimension_numbers=(((1,), (0,)), ((), ())),  # contract K dim
+        preferred_element_type=jnp.float32,
+    )                                                # (BM, BN)
 
-        @pl.when(k_iter != 0)
-        def _accum():
-            out_ref[...] = out_ref[...] + result
+    # ---- Accumulate into output ----
+    @pl.when(k_iter == 0)
+    def _():
+        out_ref[...] = partial + bias_blk[jnp.newaxis, :]
 
-    return kernel
+    @pl.when(k_iter != 0)
+    def _():
+        out_ref[...] += partial
 
 
-def _pallas_fused(x_2d, weight, bias, alpha, s, gamma, beta):
-    """Invoke Pallas kernel. x_2d: (M, K), weight: (K, N)."""
-    from jax.experimental import pallas as pl
-    from jax.experimental.pallas import tpu as pltpu
-
+def _pallas_forward(x_2d, weight, bias, alpha, s, gamma, beta):
+    """Invoke the Pallas kernel.  x_2d: (M, K), weight: (K, N)."""
     M, K = x_2d.shape
     N = weight.shape[1]
 
-    kernel_fn = _make_kernel(alpha, s)
+    kernel_fn = functools.partial(_fused_kernel, alpha=alpha, s=s)
 
     return pl.pallas_call(
         kernel_fn,
-        out_shape=jax.ShapeDtypeStruct((M, N), x_2d.dtype),
-        grid=(M // _BM, N // _BN, K // _BK),
-        in_specs=[
-            pl.BlockSpec((_BM, _BK), lambda m, n, k: (m, k)),
-            pl.BlockSpec((_BK, _BN), lambda m, n, k: (k, n)),
-            pl.BlockSpec((_BN,), lambda m, n, k: (n,)),
-            pl.BlockSpec((_BK,), lambda m, n, k: (k,)),
-            pl.BlockSpec((_BK,), lambda m, n, k: (k,)),
-        ],
-        out_specs=pl.BlockSpec((_BM, _BN), lambda m, n, k: (m, n)),
-        compiler_params=pltpu.TPUCompilerParams(
+        out_shape=jax.ShapeDtypeStruct((M, N), jnp.float32),
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=0,
+            in_specs=[
+                pl.BlockSpec((_BM, _BK), lambda m, n, k: (m, k)),  # x
+                pl.BlockSpec((_BK, _BN), lambda m, n, k: (k, n)),  # weight
+                pl.BlockSpec((_BN,),     lambda m, n, k: (n,)),     # bias
+                pl.BlockSpec((_BK,),     lambda m, n, k: (k,)),     # gamma
+                pl.BlockSpec((_BK,),     lambda m, n, k: (k,)),     # beta
+            ],
+            out_specs=pl.BlockSpec((_BM, _BN), lambda m, n, k: (m, n)),
+            grid=(M // _BM, N // _BN, K // _BK),
+        ),
+        compiler_params=pltpu.CompilerParams(
             dimension_semantics=("parallel", "parallel", "arbitrary"),
         ),
     )(x_2d, weight, bias, gamma, beta)
 
 
 # ---------------------------------------------------------------------------
-# Public API with custom_vjp
+# Dispatch: Pallas on TPU when shapes align, JAX fallback otherwise
 # ---------------------------------------------------------------------------
 def _can_use_pallas(M, K, N):
     return (
         jax.default_backend() == "tpu"
-        and M >= _MIN_M
         and M % _BM == 0
         and K % _BK == 0
         and N % _BN == 0
     )
 
 
-def _impl(x, weight, bias, alpha, s, gamma, beta):
-    """Forward implementation: Pallas on TPU, JAX fallback otherwise."""
+def _forward_impl(x, weight, bias, alpha, s, gamma, beta):
+    """Run forward pass, choosing Pallas or JAX fallback."""
     leading = x.shape[:-1]
     K = x.shape[-1]
     N = weight.shape[-1]
@@ -115,46 +133,50 @@ def _impl(x, weight, bias, alpha, s, gamma, beta):
     x_2d = x.reshape(M, K)
 
     if _can_use_pallas(M, K, N):
-        out_2d = _pallas_fused(x_2d, weight, bias, alpha, s, gamma, beta)
+        out_2d = _pallas_forward(x_2d, weight, bias, alpha, s, gamma, beta)
     else:
         out_2d = _derf_linear_ref(x_2d, weight, bias, alpha, s, gamma, beta)
 
     return out_2d.reshape(*leading, N)
 
 
+# ---------------------------------------------------------------------------
+# Public API with custom_vjp for backpropagation
+# ---------------------------------------------------------------------------
 @functools.partial(jax.custom_vjp)
 def fused_derf_linear(x, weight, bias, alpha, s, gamma, beta):
-    """Fused Derf normalization + linear projection.
+    """Fused Derf + linear projection.
 
     Computes: (gamma * erf(alpha * x + s) + beta) @ weight + bias
 
     Args:
-        x: (..., dim) input
-        weight: (dim, out_dim) projection weight
-        bias: (out_dim,) projection bias
-        alpha: scalar Derf parameter
-        s: scalar Derf shift parameter
-        gamma: (dim,) Derf per-dim scale
-        beta: (dim,) Derf per-dim bias
+        x:      (..., dim) input tensor.
+        weight: (dim, out_dim) projection matrix.
+        bias:   (out_dim,) projection bias.
+        alpha:  scalar Derf scale parameter.
+        s:      scalar Derf shift parameter.
+        gamma:  (dim,) per-channel Derf scale.
+        beta:   (dim,) per-channel Derf bias.
 
     Returns:
-        (..., out_dim) output
+        (..., out_dim) output tensor.
     """
-    return _impl(x, weight, bias, alpha, s, gamma, beta)
+    return _forward_impl(x, weight, bias, alpha, s, gamma, beta)
 
 
 def _fwd(x, weight, bias, alpha, s, gamma, beta):
-    out = _impl(x, weight, bias, alpha, s, gamma, beta)
+    out = _forward_impl(x, weight, bias, alpha, s, gamma, beta)
+    # Save residuals for backward — recompute intermediates to save memory.
     return out, (x, weight, alpha, s, gamma, beta)
 
 
 def _bwd(res, g):
     x, weight, alpha, s, gamma, beta = res
 
-    # Recompute intermediates
+    # Recompute intermediates (cheaper than saving from forward).
     u = alpha * x + s
     erf_u = lax.erf(u)
-    normed = gamma * erf_u + beta
+    normed = gamma * erf_u + beta                                # (..., K)
 
     leading = x.shape[:-1]
     K = x.shape[-1]
@@ -166,19 +188,25 @@ def _bwd(res, g):
     normed_2d = normed.reshape(M, K)
     g_2d = g.reshape(M, N)
 
-    d_bias = g_2d.sum(axis=0)
-    d_weight = normed_2d.T @ g_2d
-    d_normed = (g_2d @ weight.T).reshape(x.shape)
+    # ---- Gradients ----
+    # d(output)/d(bias) = I
+    d_bias = g_2d.sum(axis=0)                                    # (N,)
+
+    # d(output)/d(weight) = normed^T @ g
+    d_weight = normed_2d.T @ g_2d                                # (K, N)
+
+    # d(output)/d(normed) = g @ weight^T
+    d_normed = (g_2d @ weight.T).reshape(x.shape)                # (..., K)
+
+    # erf'(u) = 2/sqrt(pi) * exp(-u^2)
+    erf_deriv = (2.0 / jnp.sqrt(jnp.pi)) * jnp.exp(-(u * u))
 
     reduce_axes = tuple(range(len(leading)))
-    d_beta = d_normed.sum(axis=reduce_axes)
-    d_gamma = (d_normed * erf_u).sum(axis=reduce_axes)
-
-    erf_deriv = (2.0 / jnp.sqrt(jnp.pi)) * jnp.exp(-u * u)
-
-    d_x = d_normed * gamma * erf_deriv * alpha
-    d_alpha = (d_normed * gamma * erf_deriv * x).sum()
-    d_s = (d_normed * gamma * erf_deriv).sum()
+    d_gamma = (d_normed * erf_u).sum(axis=reduce_axes)           # (K,)
+    d_beta  = d_normed.sum(axis=reduce_axes)                     # (K,)
+    d_x     = d_normed * gamma * erf_deriv * alpha               # (..., K)
+    d_alpha = (d_normed * gamma * erf_deriv * x).sum()           # scalar
+    d_s     = (d_normed * gamma * erf_deriv).sum()               # scalar
 
     return (d_x, d_weight, d_bias, d_alpha, d_s, d_gamma, d_beta)
 

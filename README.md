@@ -94,16 +94,52 @@ Documents are tokenized, concatenated, and chunked into fixed-length sequences. 
 
 ### TPU Setup
 
-On a Google Cloud TPU VM:
+#### 1. Create and connect to TPU VM
+
+```bash
+gcloud compute tpus tpu-vm create my-bert-bench \
+  --zone=us-central2-b \
+  --accelerator-type=v4-8 \
+  --version=tpu-ubuntu2204-base
+
+gcloud compute tpus tpu-vm ssh my-bert-bench --zone=us-central2-b
+```
+
+#### 2. Install dependencies
 
 ```bash
 git clone <repo-url> && cd attention_benchmark
 bash setup_tpu.sh
 source .venv/bin/activate
-python benchmarks/pretrain.py --model both --size base --steps 1000
 ```
 
 The setup script installs `jax[tpu]`, project dependencies, and verifies TPU access.
+
+#### 3. Run tests
+
+```bash
+# Unit tests
+pytest tests/test_correctness.py -v
+
+# Smoke test (few steps, tiny config)
+python benchmarks/pretrain.py --model both --size small --steps 5 --batch-size 2 --seq-len 32 --log-interval 1
+```
+
+#### 4. Run benchmarks
+
+```bash
+# BERT-Small quick comparison (~30M params)
+python benchmarks/pretrain.py --model both --size small --steps 1000 --batch-size 64
+
+# BERT-Base full comparison (~110M params)
+python benchmarks/pretrain.py --model both --size base --steps 10000 --batch-size 64
+
+# With checkpointing
+python benchmarks/pretrain.py --model both --size base --steps 10000 --batch-size 64 \
+  --checkpoint-dir checkpoints/ --checkpoint-interval 2000
+```
+
+When using `--model both`, both models train sequentially with identical data order and a comparison table prints at the end.
 
 ## Project structure
 

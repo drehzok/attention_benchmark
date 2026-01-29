@@ -108,13 +108,13 @@ def _pallas_forward(x_2d, weight, bias, alpha, s, gamma, beta):
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=1,
             in_specs=[
-                pl.BlockSpec((_BM, _BK), lambda _, m, n, k: (m, k)),  # x
-                pl.BlockSpec((_BK, _BN), lambda _, m, n, k: (k, n)),  # weight
-                pl.BlockSpec((_BN,),     lambda _, m, n, k: (n,)),     # bias
-                pl.BlockSpec((_BK,),     lambda _, m, n, k: (k,)),     # gamma
-                pl.BlockSpec((_BK,),     lambda _, m, n, k: (k,)),     # beta
+                pl.BlockSpec((_BM, _BK), lambda m, n, k, _: (m, k)),  # x
+                pl.BlockSpec((_BK, _BN), lambda m, n, k, _: (k, n)),  # weight
+                pl.BlockSpec((_BN,),     lambda m, n, k, _: (n,)),     # bias
+                pl.BlockSpec((_BK,),     lambda m, n, k, _: (k,)),     # gamma
+                pl.BlockSpec((_BK,),     lambda m, n, k, _: (k,)),     # beta
             ],
-            out_specs=pl.BlockSpec((_BM, _BN), lambda _, m, n, k: (m, n)),
+            out_specs=pl.BlockSpec((_BM, _BN), lambda m, n, k, _: (m, n)),
             grid=(M // _BM, N // _BN, K // _BK),
         ),
         compiler_params=pltpu.CompilerParams(

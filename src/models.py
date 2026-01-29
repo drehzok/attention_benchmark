@@ -186,12 +186,14 @@ class JaxEncoderLayer(nnx.Module):
 # ---------------------------------------------------------------------------
 class Derf(nnx.Module):
     def __init__(self, dim: int, rngs: nnx.Rngs):
-        self.alpha = nnx.Param(jnp.ones(dim))
-        self.s = nnx.Param(jnp.zeros(dim))
-        self.dim = dim
+        self.alpha = nnx.Param(jnp.array(0.5))
+        self.s = nnx.Param(jnp.array(0.0))
+    
+        self.gamma = nnx.Param(jnp.ones((dim,)))
+        self.beta = nnx.Param(jnp.zeros((dim,)))
 
     def __call__(self, x: jax.Array) -> jax.Array:
-        return jax.lax.erf(self.alpha * x + self.s)
+        return self.gamma * jax.lax.erf(self.alpha * x + self.s) + self.beta
 
 
 class TransformerBlock(nnx.Module):

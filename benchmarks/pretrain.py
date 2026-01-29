@@ -101,8 +101,8 @@ def train_model(model_type, args, config, tokenizer, print_prefix=""):
     n_params = count_params(model)
     print(f"Parameters: {n_params:,}")
 
-    optimizer = create_optimizer(args.lr, args.warmup_steps, args.steps, args.weight_decay)
-    optimizer = nnx.Optimizer(model, optimizer)
+    tx = create_optimizer(args.lr, args.warmup_steps, args.steps, args.weight_decay)
+    optimizer = nnx.Optimizer(model, tx, wrt=nnx.Param)
 
     train_step = make_train_step(model, optimizer)
 

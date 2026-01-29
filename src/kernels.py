@@ -23,6 +23,8 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+_MATMUL_DIMS = (((1,), (0,)), ((), ()))  # contract dim 1 of lhs with dim 0 of rhs
+
 # Block sizes — LCM of VPU (8,128) and MXU (128,128) optimal tiles.
 _BM = 128
 _BK = 128
@@ -41,8 +43,8 @@ def _derf_linear_ref(x, weight, bias, alpha, s, gamma, beta):
 # ---------------------------------------------------------------------------
 # Pallas forward kernel
 # ---------------------------------------------------------------------------
-def _fused_kernel(x_ref, w_ref, bias_ref, gamma_ref, beta_ref, out_ref,
-                  *, alpha, s):
+def _fused_kernel(x_ref, w_ref, bias_ref, gamma_ref, beta_ref,
+                  alpha_ref, s_ref, out_ref):
     """Fused derf + matmul kernel body.
 
     Each grid cell (m, n, k) computes a (BM, BN) partial result:
@@ -58,16 +60,19 @@ def _fused_kernel(x_ref, w_ref, bias_ref, gamma_ref, beta_ref, out_ref,
     gamma_blk = gamma_ref[...].astype(jnp.float32)  # (BK,)
     beta_blk  = beta_ref[...].astype(jnp.float32)   # (BK,)
     bias_blk  = bias_ref[...].astype(jnp.float32)   # (BN,)
+    alpha_blk = alpha_ref[...].astype(jnp.float32)  # (BK,) broadcast scalar
+    s_blk     = s_ref[...].astype(jnp.float32)      # (BK,) broadcast scalar
 
     # ---- Fused Derf (runs on VPU) ----
     normed = (gamma_blk[jnp.newaxis, :]
-              * lax.erf(alpha * x_blk + s)
+              * lax.erf(alpha_blk[jnp.newaxis, :] * x_blk
+                        + s_blk[jnp.newaxis, :])
               + beta_blk[jnp.newaxis, :])            # (BM, BK)
 
     # ---- Matrix multiply (runs on MXU) ----
     partial = lax.dot_general(
         normed, w_blk,
-        dimension_numbers=(((1,), (0,)), ((), ())),  # contract K dim
+        dimension_numbers=_MATMUL_DIMS,
         preferred_element_type=jnp.float32,
     )                                                # (BM, BN)
 
@@ -86,10 +91,12 @@ def _pallas_forward(x_2d, weight, bias, alpha, s, gamma, beta):
     M, K = x_2d.shape
     N = weight.shape[1]
 
-    kernel_fn = functools.partial(_fused_kernel, alpha=alpha, s=s)
+    # Pallas kernels cannot capture traced values — pass alpha/s as (K,) arrays.
+    alpha_arr = jnp.full((K,), alpha, dtype=jnp.float32)
+    s_arr     = jnp.full((K,), s,     dtype=jnp.float32)
 
     return pl.pallas_call(
-        kernel_fn,
+        _fused_kernel,
         out_shape=jax.ShapeDtypeStruct((M, N), jnp.float32),
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=0,
@@ -99,6 +106,8 @@ def _pallas_forward(x_2d, weight, bias, alpha, s, gamma, beta):
                 pl.BlockSpec((_BN,),     lambda m, n, k: (n,)),     # bias
                 pl.BlockSpec((_BK,),     lambda m, n, k: (k,)),     # gamma
                 pl.BlockSpec((_BK,),     lambda m, n, k: (k,)),     # beta
+                pl.BlockSpec((_BK,),     lambda m, n, k: (k,)),     # alpha
+                pl.BlockSpec((_BK,),     lambda m, n, k: (k,)),     # s
             ],
             out_specs=pl.BlockSpec((_BM, _BN), lambda m, n, k: (m, n)),
             grid=(M // _BM, N // _BN, K // _BK),
@@ -106,7 +115,7 @@ def _pallas_forward(x_2d, weight, bias, alpha, s, gamma, beta):
         compiler_params=pltpu.CompilerParams(
             dimension_semantics=("parallel", "parallel", "arbitrary"),
         ),
-    )(x_2d, weight, bias, gamma, beta)
+    )(x_2d, weight, bias, gamma, beta, alpha_arr, s_arr)
 
 
 # ---------------------------------------------------------------------------

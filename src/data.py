@@ -69,7 +69,7 @@ def create_dataset(tokenizer, seq_len=128, seed=42):
     from datasets import load_dataset, interleave_datasets
 
     wiki = load_dataset("wikimedia/wikipedia", "20231101.en", split="train", streaming=True)
-    books = load_dataset("bookcorpusopen", split="train", streaming=True, trust_remote_code=True)
+    books = load_dataset("lucadiliello/bookcorpusopen", split="train", streaming=True)
 
     # Extract text field (both have "text")
     wiki = wiki.remove_columns([c for c in wiki.column_names if c != "text"])

@@ -45,8 +45,8 @@ def _derf_linear_ref(x, weight, bias, alpha, s, gamma, beta):
 # ---------------------------------------------------------------------------
 # Pallas forward kernel
 # ---------------------------------------------------------------------------
-def _fused_kernel(scalars_ref, x_ref, w_ref, bias_ref, gamma_ref, beta_ref,
-                  out_ref):
+def _fused_kernel(scalars_ref, gamma_ref, beta_ref, bias_ref,
+                  x_ref, w_ref, out_ref):
     """Fused derf + matmul kernel body.
 
     Each grid cell (m, n, k) computes a (BM, BN) partial result:
@@ -54,9 +54,11 @@ def _fused_kernel(scalars_ref, x_ref, w_ref, bias_ref, gamma_ref, beta_ref,
         partial      = normed_block @ weight[k,n]
     and accumulates into out[m, n].  Bias is added once on the first k iter.
 
-    scalars_ref is a scalar-prefetch ref of shape (2,): [alpha, s].
+    scalars_ref, gamma_ref, beta_ref, bias_ref are scalar-prefetch refs
+    (full arrays in SMEM — no VMEM layout / alignment constraints).
     """
     k_iter = pl.program_id(2)
+    n_iter = pl.program_id(1)
 
     # Scalar prefetch — loaded once into SMEM, no tiling.
     alpha = scalars_ref[0]
@@ -66,12 +68,13 @@ def _fused_kernel(scalars_ref, x_ref, w_ref, bias_ref, gamma_ref, beta_ref,
     x_blk = x_ref[...].astype(jnp.float32)          # (BM, BK)
     w_blk = w_ref[...].astype(jnp.float32)          # (BK, BN)
 
-    # 1D params are passed as full arrays (block == array) to sidestep XLA
-    # layout vs Mosaic block-size conflicts.  Slice the relevant chunk here.
-    n_iter = pl.program_id(1)
-    gamma_blk = gamma_ref[pl.dslice(k_iter * _BK, _BK)].astype(jnp.float32)
-    beta_blk  = beta_ref[pl.dslice(k_iter * _BK, _BK)].astype(jnp.float32)
-    bias_blk  = bias_ref[pl.dslice(n_iter * _BN, _BN)].astype(jnp.float32)
+    # Slice 1D params from SMEM (no VMEM layout issues).
+    gamma_blk = lax.dynamic_slice(
+        gamma_ref[...], (k_iter * _BK,), (_BK,)).astype(jnp.float32)
+    beta_blk = lax.dynamic_slice(
+        beta_ref[...], (k_iter * _BK,), (_BK,)).astype(jnp.float32)
+    bias_blk = lax.dynamic_slice(
+        bias_ref[...], (n_iter * _BN,), (_BN,)).astype(jnp.float32)
 
     # ---- Fused Derf (runs on VPU) ----
     # Approximate erf via tanh: erf(x) ≈ tanh(2/√π · (x + 0.08943·x³))
@@ -103,30 +106,26 @@ def _pallas_forward(x_2d, weight, bias, alpha, s, gamma, beta):
     M, K = x_2d.shape
     N = weight.shape[1]
 
-    # Pack scalars for scalar_prefetch (loaded once into SMEM, no BlockSpec).
+    # All 1D params go into scalar_prefetch (SMEM) to avoid VMEM layout
+    # and alignment constraints on 1D arrays.
     scalars = jnp.array([alpha, s], dtype=jnp.float32)
 
-    # Pass 1D params with block == array (full load) to avoid XLA layout
-    # vs Mosaic tiling conflicts.  The kernel slices the k/n chunk via dslice.
     return pl.pallas_call(
         _fused_kernel,
         out_shape=jax.ShapeDtypeStruct((M, N), jnp.float32),
         grid_spec=pltpu.PrefetchScalarGridSpec(
-            num_scalar_prefetch=1,
+            num_scalar_prefetch=4,  # scalars, gamma, beta, bias
             in_specs=[
-                pl.BlockSpec((_BM, _BK), lambda m, n, k, _: (m, k)),  # x
-                pl.BlockSpec((_BK, _BN), lambda m, n, k, _: (k, n)),  # weight
-                pl.BlockSpec((N,),       lambda m, n, k, _: (0,)),     # bias  (full)
-                pl.BlockSpec((K,),       lambda m, n, k, _: (0,)),     # gamma (full)
-                pl.BlockSpec((K,),       lambda m, n, k, _: (0,)),     # beta  (full)
+                pl.BlockSpec((_BM, _BK), lambda m, n, k, *_: (m, k)),  # x
+                pl.BlockSpec((_BK, _BN), lambda m, n, k, *_: (k, n)),  # weight
             ],
-            out_specs=pl.BlockSpec((_BM, _BN), lambda m, n, k, _: (m, n)),
+            out_specs=pl.BlockSpec((_BM, _BN), lambda m, n, k, *_: (m, n)),
             grid=(M // _BM, N // _BN, K // _BK),
         ),
         compiler_params=pltpu.CompilerParams(
             dimension_semantics=("parallel", "parallel", "arbitrary"),
         ),
-    )(scalars, x_2d, weight, bias, gamma, beta)
+    )(scalars, gamma, beta, bias, x_2d, weight)
 
 
 # ---------------------------------------------------------------------------

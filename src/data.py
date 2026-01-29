@@ -1,6 +1,8 @@
 """Data pipeline for BERT pretraining (Wikipedia + BookCorpusOpen, streaming)."""
 
 import itertools
+import queue
+import threading
 
 import jax.numpy as jnp
 import numpy as np
@@ -96,8 +98,12 @@ def create_dataset(tokenizer, seq_len=128, seed=42):
     return tokenize_and_chunk()
 
 
-def create_dataloader(dataset, batch_size, tokenizer, mlm_prob=0.15, seed=42):
+def create_dataloader(dataset, batch_size, tokenizer, mlm_prob=0.15, seed=42,
+                      prefetch=8):
     """Iterate over dataset, yield JAX arrays of (input_ids, labels).
+
+    Uses a background thread to prefetch batches so data loading overlaps
+    with TPU computation.
 
     Args:
         dataset: iterable of np.ndarray chunks (seq_len,)
@@ -105,18 +111,31 @@ def create_dataloader(dataset, batch_size, tokenizer, mlm_prob=0.15, seed=42):
         tokenizer: HuggingFace tokenizer for MLM masking
         mlm_prob: MLM masking probability
         seed: random seed for masking
+        prefetch: number of batches to prefetch in background
 
     Yields:
         (input_ids, labels) as jnp.ndarray of shape (batch_size, seq_len)
     """
-    rng = np.random.default_rng(seed)
+    q = queue.Queue(maxsize=prefetch)
+    sentinel = None
+
+    def producer():
+        rng = np.random.default_rng(seed)
+        while True:
+            batch = list(itertools.islice(dataset, batch_size))
+            if len(batch) < batch_size:
+                break
+            batch_ids = np.stack(batch)
+            input_ids, labels = mlm_collate(batch_ids, tokenizer,
+                                            mlm_prob=mlm_prob, rng=rng)
+            q.put((jnp.array(input_ids), jnp.array(labels)))
+        q.put(sentinel)
+
+    thread = threading.Thread(target=producer, daemon=True)
+    thread.start()
 
     while True:
-        batch = list(itertools.islice(dataset, batch_size))
-        if len(batch) < batch_size:
+        item = q.get()
+        if item is None:
             break
-
-        batch_ids = np.stack(batch)
-        input_ids, labels = mlm_collate(batch_ids, tokenizer, mlm_prob=mlm_prob, rng=rng)
-
-        yield jnp.array(input_ids), jnp.array(labels)
+        yield item

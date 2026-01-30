@@ -145,6 +145,27 @@ def finetune_one(model_type, args, config, tokenizer, task_info,
         optimizer.update(model, grads)
         return loss
 
+    if args.wandb:
+        import wandb
+        wandb.init(
+            project=args.wandb_project,
+            name=f"{model_type}-{args.task}",
+            config={
+                "model_type": model_type,
+                "task": args.task,
+                "size": args.size,
+                **config,
+                "num_classes": num_classes,
+                "epochs": args.epochs,
+                "batch_size": args.batch_size,
+                "lr": args.lr,
+                "weight_decay": args.weight_decay,
+                "dropout": args.dropout,
+                "seq_len": args.seq_len,
+                "params": count_params(model),
+            },
+        )
+
     # Training loop
     start_time = time.perf_counter()
     global_step = 0
@@ -176,11 +197,22 @@ def finetune_one(model_type, args, config, tokenizer, task_info,
               f"{' | '.join(results_str)} | "
               f"{elapsed:.1f}s")
 
+        if args.wandb:
+            log_dict = {"train/loss": avg_loss}
+            for val_name, (val_ids, val_labels) in val_splits.items():
+                acc = evaluate(model, val_ids, val_labels, args.batch_size)
+                log_dict[f"val/{val_name}"] = acc
+            wandb.log(log_dict, step=epoch + 1)
+
     # Final evaluation
     final_results = {}
     for val_name, (val_ids, val_labels) in val_splits.items():
         acc = evaluate(model, val_ids, val_labels, args.batch_size)
         final_results[val_name] = acc
+
+    if args.wandb:
+        wandb.log({f"final/{k}": v for k, v in final_results.items()})
+        wandb.finish()
 
     return {
         "model_type": model_type,
@@ -220,6 +252,10 @@ def main():
     parser.add_argument("--dropout", type=float, default=0.1)
     parser.add_argument("--seq-len", type=int, default=128)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--wandb", action="store_true",
+                        help="Enable Weights & Biases logging")
+    parser.add_argument("--wandb-project", type=str, default="derf-glue",
+                        help="W&B project name (default: derf-glue)")
     args = parser.parse_args()
 
     # Determine which models to run

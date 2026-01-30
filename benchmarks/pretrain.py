@@ -133,6 +133,29 @@ def train_model(model_type, args, config, tokenizer, mesh, print_prefix=""):
     )
 
     n_mesh_devices = len(mesh.devices.flat)
+
+    if args.wandb:
+        import wandb
+        wandb.init(
+            project=args.wandb_project,
+            name=args.wandb_name or f"{model_type}-{args.size}",
+            config={
+                "model_type": model_type,
+                "size": args.size,
+                **config,
+                "batch_size": args.batch_size,
+                "lr": args.lr,
+                "warmup_steps": args.warmup_steps,
+                "steps": args.steps,
+                "seq_len": args.seq_len,
+                "mlm_prob": args.mlm_prob,
+                "dropout": args.dropout,
+                "weight_decay": args.weight_decay,
+                "num_devices": n_mesh_devices,
+                "params": n_params,
+            },
+        )
+
     print(f"Starting training for {args.steps} steps "
           f"({'single device' if n_mesh_devices == 1 else f'data-parallel across {n_mesh_devices} devices'})...")
     total_tokens = 0
@@ -169,6 +192,14 @@ def train_model(model_type, args, config, tokenizer, mesh, print_prefix=""):
                 f"{tokens_per_sec:.0f} tok/s"
             )
 
+            if args.wandb:
+                wandb.log({
+                    "train/loss": loss_val,
+                    "perf/steps_per_sec": steps_per_sec,
+                    "perf/tokens_per_sec": tokens_per_sec,
+                    "perf/step_time_sec": step_elapsed,
+                }, step=step + 1)
+
         if args.checkpoint_dir and (step + 1) % args.checkpoint_interval == 0:
             save_checkpoint(model, optimizer, step + 1, model_type, args)
 
@@ -180,6 +211,9 @@ def train_model(model_type, args, config, tokenizer, mesh, print_prefix=""):
     print(f"  Total time:      {total_time:.1f}s")
     print(f"  Avg tok/s:       {avg_tokens_per_sec:.0f}")
     print(f"  Final loss:      {losses[-1]:.4f}" if losses else "  No steps completed")
+
+    if args.wandb:
+        wandb.finish()
 
     return {
         "model_type": model_type,
@@ -241,6 +275,12 @@ def main():
                         help="Disable SPMD data parallelism (single device). "
                              "Required for --model fused on multi-device TPU "
                              "because Pallas/Mosaic kernels can't be auto-partitioned.")
+    parser.add_argument("--wandb", action="store_true",
+                        help="Enable Weights & Biases logging")
+    parser.add_argument("--wandb-project", type=str, default="derf-pretrain",
+                        help="W&B project name (default: derf-pretrain)")
+    parser.add_argument("--wandb-name", type=str, default="",
+                        help="W&B run name (default: auto-generated)")
     args = parser.parse_args()
 
     # Multi-host TPU initialization (skip on single-host Colab/Kaggle)

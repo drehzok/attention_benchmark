@@ -231,8 +231,11 @@ def main():
                         help="Random seed (default: 42)")
     args = parser.parse_args()
 
-    # Multi-host TPU initialization
-    jax.distributed.initialize()
+    # Multi-host TPU initialization (skip on single-host Colab/Kaggle)
+    try:
+        jax.distributed.initialize()
+    except Exception:
+        pass  # single-host: no coordinator needed
 
     devices = jax.devices()
     num_devices = len(devices)

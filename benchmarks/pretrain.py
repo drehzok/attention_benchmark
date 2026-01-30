@@ -230,7 +230,7 @@ def save_checkpoint(model, optimizer, step, model_type, args):
     try:
         import orbax.checkpoint as ocp
 
-        path = os.path.join(args.checkpoint_dir, f"{model_type}_step{step}")
+        path = os.path.abspath(os.path.join(args.checkpoint_dir, f"{model_type}_step{step}"))
         os.makedirs(path, exist_ok=True)
 
         _, state = nnx.split(model)

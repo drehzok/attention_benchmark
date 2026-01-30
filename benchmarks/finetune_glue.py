@@ -101,9 +101,9 @@ def finetune_one(model_type, args, config, tokenizer, task_info,
     # Load pretrained checkpoint if provided
     ckpt_path = args.checkpoint
     if not ckpt_path and args.checkpoint_dir:
-        ckpt_path = os.path.join(
+        ckpt_path = os.path.abspath(os.path.join(
             args.checkpoint_dir, f"{model_type}_step{args.step}", "state"
-        )
+        ))
 
     if ckpt_path and os.path.exists(ckpt_path):
         load_checkpoint(bert, ckpt_path)

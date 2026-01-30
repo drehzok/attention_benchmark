@@ -1,10 +1,9 @@
-"""Standalone test script for fused_derf_linear kernel.
+"""Tests for pallas_matmul kernel (forward + backward).
 
-Tests forward and backward correctness against a pure JAX reference.
-Covers multiple shapes, gradient checks, JIT compatibility, and
-value_and_grad integration.
+Tests forward and backward correctness against pure JAX reference,
+gradient checks, JIT compatibility, and various shapes.
 
-Run:  python tests/test_fused_derf_linear.py
+Run:  python tests/test_pallas_matmul.py
 """
 
 import sys
@@ -14,68 +13,53 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import jax
 import jax.numpy as jnp
-from jax import lax
 
-from src.kernels import fused_derf_linear
+from src.kernels import pallas_matmul
 
 
 # ---------------------------------------------------------------------------
-# Reference implementation (independent of src/kernels to avoid circular trust)
+# Reference
 # ---------------------------------------------------------------------------
-def reference_derf_linear(x, weight, bias, alpha, s, gamma, beta):
-    """Pure JAX: (gamma * erf(alpha*x + s) + beta) @ weight + bias."""
-    normed = gamma * lax.erf(alpha * x + s) + beta
-    return normed @ weight + bias
+def reference_linear(x, weight, bias):
+    """Pure JAX: x @ weight + bias."""
+    return x @ weight + bias
 
 
 def make_inputs(key, batch_shape, dim, out_dim):
-    """Generate random test inputs with reasonable magnitudes."""
-    keys = jax.random.split(key, 5)
+    keys = jax.random.split(key, 3)
     x      = jax.random.normal(keys[0], (*batch_shape, dim))
     weight = jax.random.normal(keys[1], (dim, out_dim)) * 0.1
     bias   = jax.random.normal(keys[2], (out_dim,)) * 0.1
-    alpha  = jnp.array(0.5)
-    s      = jnp.array(0.1)
-    gamma  = jax.random.normal(keys[3], (dim,)) * 0.5 + 1.0
-    beta   = jax.random.normal(keys[4], (dim,)) * 0.1
-    return x, weight, bias, alpha, s, gamma, beta
+    return x, weight, bias
 
 
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
 def test_forward_correctness():
-    """Forward output must match the reference for various shapes."""
     print("=" * 60)
     print("TEST: Forward correctness")
     print("=" * 60)
 
     shapes = [
-        # (batch_shape, dim, out_dim, description)
-        ((2, 16),  64,  128,  "small – JAX fallback"),
-        ((4, 32),  128, 256,  "medium"),
-        ((8, 64),  256, 512,  "large"),
-        ((128,),   128, 128,  "2-D input (M=128)"),
-        ((2, 4, 8), 64, 128,  "3-D batch"),
-        # TPU-aligned shapes (will use Pallas on TPU)
-        ((1, 128), 128, 128,  "TPU-aligned minimal"),
-        ((4, 128), 256, 512,  "TPU-aligned large"),
+        ((2, 16),   64,  128,  "small – JAX fallback"),
+        ((4, 32),   128, 256,  "medium"),
+        ((128,),    128, 128,  "2-D input (M=128)"),
+        ((2, 4, 8), 64,  128,  "3-D batch"),
+        ((1, 128),  128, 128,  "TPU-aligned minimal"),
+        ((4, 128),  256, 512,  "TPU-aligned large"),
     ]
 
     all_passed = True
     for batch_shape, dim, out_dim, desc in shapes:
         key = jax.random.PRNGKey(42)
-        x, weight, bias, alpha, s, gamma, beta = make_inputs(
-            key, batch_shape, dim, out_dim
-        )
+        x, weight, bias = make_inputs(key, batch_shape, dim, out_dim)
 
-        out_fused = fused_derf_linear(x, weight, bias, alpha, s, gamma, beta)
-        out_ref   = reference_derf_linear(x, weight, bias, alpha, s, gamma, beta)
+        out_kernel = pallas_matmul(x, weight, bias)
+        out_ref    = reference_linear(x, weight, bias)
 
-        max_err = float(jnp.max(jnp.abs(out_fused - out_ref)))
-        # On TPU the Pallas kernel uses a tanh approximation of erf (max ~3.6e-4),
-        # which gets amplified through the matmul.  On CPU the fallback is exact.
-        passed  = bool(jnp.allclose(out_fused, out_ref, atol=1e-2, rtol=1e-3))
+        max_err = float(jnp.max(jnp.abs(out_kernel - out_ref)))
+        passed  = bool(jnp.allclose(out_kernel, out_ref, atol=1e-4, rtol=1e-4))
         status  = "PASS" if passed else "FAIL"
 
         print(f"  [{status}] {desc:30s}  "
@@ -88,7 +72,6 @@ def test_forward_correctness():
 
 
 def test_backward_correctness():
-    """Custom VJP gradients must match JAX autograd on the reference."""
     print("=" * 60)
     print("TEST: Backward correctness (gradients)")
     print("=" * 60)
@@ -100,39 +83,38 @@ def test_backward_correctness():
         ((1, 128), 128, 128,  "TPU-aligned"),
     ]
 
-    names = ["x", "weight", "bias", "alpha", "s", "gamma", "beta"]
+    names = ["x", "weight", "bias"]
     all_passed = True
 
     for batch_shape, dim, out_dim, desc in shapes:
         key = jax.random.PRNGKey(7)
         args = make_inputs(key, batch_shape, dim, out_dim)
 
-        def loss_fused(*a):
-            return fused_derf_linear(*a).sum()
+        def loss_kernel(*a):
+            return pallas_matmul(*a).sum()
 
         def loss_ref(*a):
-            return reference_derf_linear(*a).sum()
+            return reference_linear(*a).sum()
 
-        grads_fused = jax.grad(loss_fused, argnums=tuple(range(7)))(*args)
-        grads_ref   = jax.grad(loss_ref,   argnums=tuple(range(7)))(*args)
+        grads_kernel = jax.grad(loss_kernel, argnums=(0, 1, 2))(*args)
+        grads_ref    = jax.grad(loss_ref,    argnums=(0, 1, 2))(*args)
 
         shape_passed = True
-        for gf, gr, name in zip(grads_fused, grads_ref, names):
-            max_err = float(jnp.max(jnp.abs(gf - gr)))
-            ok = bool(jnp.allclose(gf, gr, atol=1e-4, rtol=1e-4))
+        for gk, gr, name in zip(grads_kernel, grads_ref, names):
+            max_err = float(jnp.max(jnp.abs(gk - gr)))
+            ok = bool(jnp.allclose(gk, gr, atol=1e-4, rtol=1e-4))
             if not ok:
                 print(f"  [FAIL] {desc} grad_{name}  max_err={max_err:.2e}")
                 shape_passed = False
                 all_passed = False
 
         if shape_passed:
-            print(f"  [PASS] {desc:30s}  all 7 gradients match")
+            print(f"  [PASS] {desc:30s}  all 3 gradients match")
 
     return all_passed
 
 
 def test_finite_gradients():
-    """All gradients must be finite (no NaN / Inf)."""
     print("=" * 60)
     print("TEST: Gradient finiteness")
     print("=" * 60)
@@ -141,11 +123,11 @@ def test_finite_gradients():
     args = make_inputs(key, (4, 32), 128, 256)
 
     grads = jax.grad(
-        lambda *a: fused_derf_linear(*a).sum(),
-        argnums=tuple(range(7)),
+        lambda *a: pallas_matmul(*a).sum(),
+        argnums=(0, 1, 2),
     )(*args)
 
-    names = ["x", "weight", "bias", "alpha", "s", "gamma", "beta"]
+    names = ["x", "weight", "bias"]
     all_ok = True
     for g, name in zip(grads, names):
         if not bool(jnp.all(jnp.isfinite(g))):
@@ -158,7 +140,6 @@ def test_finite_gradients():
 
 
 def test_jit_compatibility():
-    """fused_derf_linear must work under jax.jit (forward + backward)."""
     print("=" * 60)
     print("TEST: JIT compatibility")
     print("=" * 60)
@@ -168,12 +149,12 @@ def test_jit_compatibility():
 
     @jax.jit
     def fwd(*a):
-        return fused_derf_linear(*a)
+        return pallas_matmul(*a)
 
     @jax.jit
     def grad_fn(*a):
-        return jax.grad(lambda *a: fused_derf_linear(*a).sum(),
-                        argnums=tuple(range(7)))(*a)
+        return jax.grad(lambda *a: pallas_matmul(*a).sum(),
+                        argnums=(0, 1, 2))(*a)
 
     out   = fwd(*args)
     grads = grad_fn(*args)
@@ -187,7 +168,6 @@ def test_jit_compatibility():
 
 
 def test_value_and_grad():
-    """jax.value_and_grad must produce consistent loss and gradients."""
     print("=" * 60)
     print("TEST: value_and_grad")
     print("=" * 60)
@@ -196,10 +176,10 @@ def test_value_and_grad():
     args = make_inputs(key, (2, 16), 64, 128)
 
     def loss(*a):
-        return fused_derf_linear(*a).sum()
+        return pallas_matmul(*a).sum()
 
-    val, grads = jax.value_and_grad(loss, argnums=tuple(range(7)))(*args)
-    ref_val = reference_derf_linear(*args).sum()
+    val, grads = jax.value_and_grad(loss, argnums=(0, 1, 2))(*args)
+    ref_val = reference_linear(*args).sum()
 
     val_ok  = bool(jnp.allclose(val, ref_val, atol=1e-4))
     grad_ok = all(bool(jnp.all(jnp.isfinite(g))) for g in grads)
@@ -210,27 +190,16 @@ def test_value_and_grad():
 
 
 def test_numerical_gradient():
-    """Finite-difference gradient check for d_x (sanity check on erf')."""
+    """Finite-difference gradient check for d_x."""
     print("=" * 60)
     print("TEST: Numerical gradient check (finite differences)")
     print("=" * 60)
 
-    # TPU MXU defaults to bfloat16 matmul precision, which makes finite-diff
-    # unreliable: error ≈ matmul_noise / eps ≈ 1e-2 / 1e-4 = 100.
-    # The analytic backward test already validates gradient correctness.
-    if jax.default_backend() == "tpu":
-        print("  [SKIP] Finite-diff unreliable on TPU (bfloat16 matmul precision)")
-        return True
-
     key = jax.random.PRNGKey(77)
-    # Use small shapes for finite-diff speed.
-    x, weight, bias, alpha, s, gamma, beta = make_inputs(key, (2, 4), 8, 16)
+    x, weight, bias = make_inputs(key, (2, 4), 8, 16)
 
     def f(x_flat):
-        x_shaped = x_flat.reshape(x.shape)
-        return fused_derf_linear(
-            x_shaped, weight, bias, alpha, s, gamma, beta
-        ).sum()
+        return pallas_matmul(x_flat.reshape(x.shape), weight, bias).sum()
 
     x_flat = x.ravel()
     analytic = jax.grad(f)(x_flat)
@@ -242,7 +211,7 @@ def test_numerical_gradient():
         numerical = numerical.at[i].set((f(x_flat + e) - f(x_flat - e)) / (2 * eps))
 
     max_err = float(jnp.max(jnp.abs(analytic - numerical)))
-    ok = max_err < 1e-2  # finite-diff is inherently noisy
+    ok = max_err < 1e-2
 
     print(f"  [{'PASS' if ok else 'FAIL'}] d_x finite-diff  max_err={max_err:.2e}")
     return ok

@@ -1,18 +1,11 @@
-"""Fused Derf normalization + linear projection via JAX Pallas kernels (TPU).
-
-Computes: output = (gamma * erf(alpha * x + s) + beta) @ weight + bias
-
-The forward pass runs as a single fused Pallas kernel on TPU that keeps the
-Derf intermediate in VMEM, avoiding an HBM round-trip.  Falls back to pure
-JAX on non-TPU backends or when shapes are not aligned to block sizes.
-
-The backward pass uses pure JAX with recomputation of intermediates.
+"""Pallas TPU kernels: matmul and fused Derf+linear.
 
 Block sizes (128, 128) are the LCM of VPU-optimal (8, 128) and MXU-optimal
 (128, 128), giving good utilisation on both processing units.
 
-erf  -> computed on VPU  (optimal tile: multiple of (8, 128))
-matmul -> computed on MXU (optimal tile: (128, 128))
+Public API:
+    pallas_matmul       — y = x @ w + bias   (Pallas fwd + bwd on TPU)
+    fused_derf_linear   — y = (γ·erf(α·x+s)+β) @ w + bias  (Pallas fwd, JAX bwd)
 """
 
 import functools
@@ -33,6 +26,145 @@ _BK = 128
 _BN = 128
 
 
+# ===========================================================================
+# Pallas matmul kernel (fwd + bwd)
+# ===========================================================================
+
+def _matmul_kernel(x_ref, w_ref, out_ref):
+    """Tiled matmul: accumulates x_block @ w_block over K tiles."""
+    k_iter = pl.program_id(2)
+
+    x_blk = x_ref[...].astype(jnp.float32)   # (BM, BK)
+    w_blk = w_ref[...].astype(jnp.float32)   # (BK, BN)
+
+    partial = lax.dot_general(
+        x_blk, w_blk,
+        dimension_numbers=_MATMUL_DIMS,
+        preferred_element_type=jnp.float32,
+    )                                          # (BM, BN)
+
+    @pl.when(k_iter == 0)
+    def _():
+        out_ref[...] = partial
+
+    @pl.when(k_iter != 0)
+    def _():
+        out_ref[...] += partial
+
+
+def _pallas_matmul_2d(a, b):
+    """a: (M, K) @ b: (K, N) -> (M, N).  All dims must be multiples of 128."""
+    M, K = a.shape
+    N = b.shape[1]
+
+    return pl.pallas_call(
+        _matmul_kernel,
+        out_shape=jax.ShapeDtypeStruct((M, N), jnp.float32),
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=0,
+            in_specs=[
+                pl.BlockSpec((_BM, _BK), lambda m, n, k: (m, k)),
+                pl.BlockSpec((_BK, _BN), lambda m, n, k: (k, n)),
+            ],
+            out_specs=pl.BlockSpec((_BM, _BN), lambda m, n, k: (m, n)),
+            grid=(M // _BM, N // _BN, K // _BK),
+        ),
+        compiler_params=pltpu.CompilerParams(
+            dimension_semantics=("parallel", "parallel", "arbitrary"),
+        ),
+    )(a, b)
+
+
+def _can_use_pallas(M, K, N):
+    return (
+        jax.default_backend() == "tpu"
+        and M % _BM == 0
+        and K % _BK == 0
+        and N % _BN == 0
+    )
+
+
+# ---------------------------------------------------------------------------
+# Public API: pallas_matmul  —  y = x @ weight + bias
+# ---------------------------------------------------------------------------
+
+def _matmul_ref(x_2d, weight, bias):
+    """Pure JAX fallback."""
+    return x_2d @ weight + bias
+
+
+@functools.partial(jax.custom_vjp)
+def pallas_matmul(x, weight, bias):
+    """Linear projection y = x @ weight + bias.
+
+    Uses a Pallas matmul kernel on TPU when all dimensions are multiples of 128.
+    Falls back to pure JAX otherwise.
+
+    Args:
+        x:      (..., K) input.
+        weight: (K, N) projection matrix.
+        bias:   (N,) bias vector.
+
+    Returns:
+        (..., N) output.
+    """
+    leading = x.shape[:-1]
+    K = x.shape[-1]
+    N = weight.shape[-1]
+    M = 1
+    for d in leading:
+        M *= d
+
+    x_2d = x.reshape(M, K)
+
+    if _can_use_pallas(M, K, N):
+        out_2d = _pallas_matmul_2d(x_2d, weight) + bias
+    else:
+        out_2d = _matmul_ref(x_2d, weight, bias)
+
+    return out_2d.reshape(*leading, N)
+
+
+def _matmul_fwd(x, weight, bias):
+    out = pallas_matmul(x, weight, bias)
+    return out, (x, weight)
+
+
+def _matmul_bwd(res, g):
+    x, weight = res
+
+    leading = x.shape[:-1]
+    K = x.shape[-1]
+    N = weight.shape[-1]
+    M = 1
+    for d in leading:
+        M *= d
+
+    x_2d = x.reshape(M, K)
+    g_2d = g.reshape(M, N)
+
+    if _can_use_pallas(M, K, N):
+        # dx = g @ weight^T   (M,N) @ (N,K) -> (M,K)
+        dx_2d = _pallas_matmul_2d(g_2d, weight.T)
+        # dw = x^T @ g        (K,M) @ (M,N) -> (K,N)
+        dw = _pallas_matmul_2d(x_2d.T, g_2d)
+    else:
+        dx_2d = g_2d @ weight.T
+        dw = x_2d.T @ g_2d
+
+    dx = dx_2d.reshape(x.shape)
+    db = g_2d.sum(axis=0)
+
+    return (dx, dw, db)
+
+
+pallas_matmul.defvjp(_matmul_fwd, _matmul_bwd)
+
+
+# ===========================================================================
+# Fused Derf + linear kernel
+# ===========================================================================
+
 # ---------------------------------------------------------------------------
 # Pure JAX reference (fallback & gradient computation)
 # ---------------------------------------------------------------------------
@@ -45,56 +177,46 @@ def _derf_linear_ref(x, weight, bias, alpha, s, gamma, beta):
 # ---------------------------------------------------------------------------
 # Pallas forward kernel
 # ---------------------------------------------------------------------------
-def _fused_kernel(scalars_ref, x_ref, w_ref, bias_ref, gamma_ref, beta_ref,
-                  out_ref):
+def _fused_derf_kernel(x_ref, w_ref, alpha_ref, s_ref, gamma_ref, beta_ref,
+                       bias_ref, out_ref):
     """Fused derf + matmul kernel body.
 
-    Each grid cell (m, n, k) computes a (BM, BN) partial result:
-        normed_block = gamma[k] * erf(alpha * x[m,k] + s) + beta[k]
-        partial      = normed_block @ weight[k,n]
-    and accumulates into out[m, n].  Bias is added once on the first k iter.
-
-    scalars_ref: scalar-prefetch (SMEM), shape (2,): [alpha, s].
-    bias_ref, gamma_ref, beta_ref: VMEM full-array BlockSpecs (block == array).
-        Reshaped to 2D (num_blocks, block_size) to satisfy TPU alignment.
-        The kernel selects the relevant row via dynamic indexing.
+    All parameters use BlockSpec tiling (no scalar_prefetch):
+        x_ref:     (BM, BK) — tiled along M and K
+        w_ref:     (BK, BN) — tiled along K and N
+        alpha_ref: (1, 1)   — scalar broadcast
+        s_ref:     (1, 1)   — scalar broadcast
+        gamma_ref: (1, BK)  — tiled along K, broadcasts along M
+        beta_ref:  (1, BK)  — tiled along K, broadcasts along M
+        bias_ref:  (1, BN)  — tiled along N, broadcasts along M
     """
     k_iter = pl.program_id(2)
-    n_iter = pl.program_id(1)
 
-    # Scalar prefetch — loaded once into SMEM.
-    alpha = scalars_ref[0]
-    s     = scalars_ref[1]
-
-    # Load tiled inputs from VMEM.
     x_blk = x_ref[...].astype(jnp.float32)          # (BM, BK)
     w_blk = w_ref[...].astype(jnp.float32)          # (BK, BN)
+    alpha = alpha_ref[...].astype(jnp.float32)       # (1, 1)
+    s     = s_ref[...].astype(jnp.float32)           # (1, 1)
+    gamma = gamma_ref[...].astype(jnp.float32)       # (1, BK)
+    beta  = beta_ref[...].astype(jnp.float32)        # (1, BK)
+    bias  = bias_ref[...].astype(jnp.float32)        # (1, BN)
 
-    # 1D params stored as 2D (num_blocks, block_size) with block == array.
-    # Load full array, then dynamic-index the relevant row.
-    gamma_blk = gamma_ref[...][k_iter].astype(jnp.float32)  # (BK,)
-    beta_blk  = beta_ref[...][k_iter].astype(jnp.float32)   # (BK,)
-    bias_blk  = bias_ref[...][n_iter].astype(jnp.float32)   # (BN,)
-
-    # ---- Fused Derf (runs on VPU) ----
-    # Approximate erf via tanh: erf(x) ≈ tanh(2/√π · (x + 0.08943·x³))
-    # lax.erf has no Pallas TPU lowering; tanh does.
-    u = alpha * x_blk + s
+    # ---- Fused Derf (VPU) ----
+    # erf(x) ≈ tanh(2/√π · (x + 0.08943·x³))  (lax.erf has no Pallas lowering)
+    u = alpha * x_blk + s                            # (BM, BK)
     erf_approx = lax.tanh(_TWO_OVER_SQRT_PI * (u + _ERF_COEFF * u * u * u))
-    normed = (gamma_blk[jnp.newaxis, :] * erf_approx
-              + beta_blk[jnp.newaxis, :])            # (BM, BK)
+    normed = gamma * erf_approx + beta               # (BM, BK)
 
-    # ---- Matrix multiply (runs on MXU) ----
+    # ---- Matmul (MXU) ----
     partial = lax.dot_general(
         normed, w_blk,
         dimension_numbers=_MATMUL_DIMS,
         preferred_element_type=jnp.float32,
     )                                                # (BM, BN)
 
-    # ---- Accumulate into output ----
+    # ---- Accumulate ----
     @pl.when(k_iter == 0)
     def _():
-        out_ref[...] = partial + bias_blk[jnp.newaxis, :]
+        out_ref[...] = partial + bias
 
     @pl.when(k_iter != 0)
     def _():
@@ -105,50 +227,37 @@ def _pallas_forward(x_2d, weight, bias, alpha, s, gamma, beta):
     """Invoke the Pallas kernel.  x_2d: (M, K), weight: (K, N)."""
     M, K = x_2d.shape
     N = weight.shape[1]
-    k_blks = K // _BK
-    n_blks = N // _BN
 
-    # alpha/s as scalar_prefetch (SMEM, scalar-only loads).
-    scalars = jnp.array([alpha, s], dtype=jnp.float32)
-
-    # Reshape 1D params to 2D with block == array.  When block dims equal
-    # array dims the TPU alignment rule (div by 8/128) is automatically
-    # satisfied, and XLA layout matches Mosaic layout.
-    gamma_2d = gamma.reshape(k_blks, _BK)
-    beta_2d  = beta.reshape(k_blks, _BK)
-    bias_2d  = bias.reshape(n_blks, _BN)
+    # Reshape all params to 2D for proper BlockSpec tiling.
+    # Scalars -> (1, 1), vectors -> (1, length).
+    # Block dim[-2]=1 == array dim[-2]=1 satisfies TPU alignment.
+    alpha_2d = jnp.array([[alpha]], dtype=jnp.float32)   # (1, 1)
+    s_2d     = jnp.array([[s]],     dtype=jnp.float32)   # (1, 1)
+    gamma_2d = gamma.reshape(1, K)                        # (1, K)
+    beta_2d  = beta.reshape(1, K)                         # (1, K)
+    bias_2d  = bias.reshape(1, N)                         # (1, N)
 
     return pl.pallas_call(
-        _fused_kernel,
+        _fused_derf_kernel,
         out_shape=jax.ShapeDtypeStruct((M, N), jnp.float32),
         grid_spec=pltpu.PrefetchScalarGridSpec(
-            num_scalar_prefetch=1,
+            num_scalar_prefetch=0,
             in_specs=[
-                pl.BlockSpec((_BM, _BK),        lambda m, n, k, _: (m, k)),  # x
-                pl.BlockSpec((_BK, _BN),        lambda m, n, k, _: (k, n)),  # weight
-                pl.BlockSpec((n_blks, _BN),     lambda m, n, k, _: (0, 0)),  # bias  (full)
-                pl.BlockSpec((k_blks, _BK),     lambda m, n, k, _: (0, 0)),  # gamma (full)
-                pl.BlockSpec((k_blks, _BK),     lambda m, n, k, _: (0, 0)),  # beta  (full)
+                pl.BlockSpec((_BM, _BK), lambda m, n, k: (m, k)),  # x
+                pl.BlockSpec((_BK, _BN), lambda m, n, k: (k, n)),  # weight
+                pl.BlockSpec((1, 1),     lambda m, n, k: (0, 0)),   # alpha
+                pl.BlockSpec((1, 1),     lambda m, n, k: (0, 0)),   # s
+                pl.BlockSpec((1, _BK),   lambda m, n, k: (0, k)),   # gamma
+                pl.BlockSpec((1, _BK),   lambda m, n, k: (0, k)),   # beta
+                pl.BlockSpec((1, _BN),   lambda m, n, k: (0, n)),   # bias
             ],
-            out_specs=pl.BlockSpec((_BM, _BN), lambda m, n, k, _: (m, n)),
+            out_specs=pl.BlockSpec((_BM, _BN), lambda m, n, k: (m, n)),
             grid=(M // _BM, N // _BN, K // _BK),
         ),
         compiler_params=pltpu.CompilerParams(
             dimension_semantics=("parallel", "parallel", "arbitrary"),
         ),
-    )(scalars, x_2d, weight, bias_2d, gamma_2d, beta_2d)
-
-
-# ---------------------------------------------------------------------------
-# Dispatch: Pallas on TPU when shapes align, JAX fallback otherwise
-# ---------------------------------------------------------------------------
-def _can_use_pallas(M, K, N):
-    return (
-        jax.default_backend() == "tpu"
-        and M % _BM == 0
-        and K % _BK == 0
-        and N % _BN == 0
-    )
+    )(x_2d, weight, alpha_2d, s_2d, gamma_2d, beta_2d, bias_2d)
 
 
 def _forward_impl(x, weight, bias, alpha, s, gamma, beta):

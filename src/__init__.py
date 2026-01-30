@@ -16,5 +16,5 @@ from .models import (
     FusedTransformerBlock,
     FusedDerfBert,
 )
-from .kernels import fused_derf_linear
+from .kernels import fused_derf_linear, pallas_matmul
 from .utils import BenchmarkTimer, generate_random_inputs, setup_logger, warmup_jit

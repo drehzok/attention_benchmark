@@ -18,6 +18,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from flax import nnx
+from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
@@ -36,8 +37,11 @@ MODEL_CLASSES = {
 
 
 def benchmark_model(model_type, config, vocab_size, batch_size, seq_len,
-                    warmup_steps, bench_steps):
+                    warmup_steps, bench_steps, mesh):
     """Benchmark forward pass for one model. Returns dict of results."""
+    replicate = NamedSharding(mesh, P())
+    data_shard = NamedSharding(mesh, P('dp'))
+
     rngs = nnx.Rngs(0)
     kwargs = dict(
         vocab_size=vocab_size,
@@ -48,24 +52,33 @@ def benchmark_model(model_type, config, vocab_size, batch_size, seq_len,
         dropout_rate=0.0,
         rngs=rngs,
     )
+    if model_type == "fused":
+        kwargs["mesh"] = mesh
     model = MODEL_CLASSES[model_type](**kwargs)
 
-    input_ids = jnp.ones((batch_size, seq_len), dtype=jnp.int32)
+    # Replicate model across devices
+    state = nnx.state(model)
+    state = jax.device_put(state, replicate)
+    nnx.update(model, state)
 
-    @jax.jit
-    def forward(input_ids):
+    # Shard input across devices
+    input_ids = jnp.ones((batch_size, seq_len), dtype=jnp.int32)
+    input_ids = jax.device_put(input_ids, data_shard)
+
+    @nnx.jit
+    def forward(model, input_ids):
         return model(input_ids, deterministic=True)
 
     # Warmup (JIT compile + cache)
     for _ in range(warmup_steps):
-        out = forward(input_ids)
+        out = forward(model, input_ids)
         jax.block_until_ready(out)
 
     # Benchmark
     times = []
     for _ in range(bench_steps):
         start = time.perf_counter()
-        out = forward(input_ids)
+        out = forward(model, input_ids)
         jax.block_until_ready(out)
         elapsed = time.perf_counter() - start
         times.append(elapsed)
@@ -110,9 +123,13 @@ def main():
 
     config = CONFIGS[args.size]
 
+    # Set up SPMD mesh (same as pretrain.py)
+    devices = jax.devices()
+    mesh = Mesh(np.array(devices), axis_names=('dp',))
+
     print(f"Inference Benchmark: {args.size}")
     print(f"  Backend:     {jax.default_backend()}")
-    print(f"  Devices:     {jax.devices()}")
+    print(f"  Devices:     {len(devices)} ({devices})")
     print(f"  Config:      {config}")
     print(f"  Models:      {args.models}")
     print(f"  Batch sizes: {args.batch_sizes}")
@@ -133,7 +150,7 @@ def main():
                 "warmup": args.warmup,
                 "steps": args.steps,
                 "backend": jax.default_backend(),
-                "num_devices": len(jax.devices()),
+                "num_devices": len(devices),
             },
         )
 
@@ -152,7 +169,7 @@ def main():
                     r = benchmark_model(
                         model_type, config, args.vocab_size,
                         batch_size, seq_len,
-                        args.warmup, args.steps,
+                        args.warmup, args.steps, mesh,
                     )
                     all_results.append(r)
 

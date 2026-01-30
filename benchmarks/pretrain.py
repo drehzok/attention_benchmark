@@ -127,6 +127,27 @@ def train_model(model_type, args, config, tokenizer, mesh, print_prefix=""):
 
     train_step = make_train_step(model, optimizer)
 
+    # Resume from checkpoint if requested
+    resume_step = 0
+    if args.resume and args.checkpoint_dir:
+        resume_step = load_resume_checkpoint(optimizer, args.checkpoint_dir, model_type)
+        if resume_step > 0:
+            # Re-replicate restored state across devices
+            opt_state = nnx.state(optimizer)
+            opt_state = jax.device_put(opt_state, replicate)
+            nnx.update(optimizer, opt_state)
+
+    if resume_step >= args.steps:
+        print(f"  Already completed {resume_step} steps (target: {args.steps}). Skipping.")
+        return {
+            "model_type": model_type,
+            "params": n_params,
+            "total_time": 0,
+            "avg_tokens_per_sec": 0,
+            "final_loss": None,
+            "losses": [],
+        }
+
     dataset = create_dataset(tokenizer, seq_len=args.seq_len, seed=args.seed)
     dataloader = create_dataloader(
         dataset, args.batch_size, tokenizer, mlm_prob=args.mlm_prob, seed=args.seed
@@ -153,11 +174,15 @@ def train_model(model_type, args, config, tokenizer, mesh, print_prefix=""):
                 "weight_decay": args.weight_decay,
                 "num_devices": n_mesh_devices,
                 "params": n_params,
+                "resume_step": resume_step,
             },
+            resume="allow" if resume_step > 0 else None,
         )
 
-    print(f"Starting training for {args.steps} steps "
-          f"({'single device' if n_mesh_devices == 1 else f'data-parallel across {n_mesh_devices} devices'})...")
+    remaining = args.steps - resume_step
+    print(f"Starting training for {remaining} steps "
+          f"(step {resume_step + 1} -> {args.steps}, "
+          f"{'single device' if n_mesh_devices == 1 else f'data-parallel across {n_mesh_devices} devices'})...")
     total_tokens = 0
     start_time = time.perf_counter()
     step_times = []
@@ -166,6 +191,10 @@ def train_model(model_type, args, config, tokenizer, mesh, print_prefix=""):
     for step, (input_ids, labels) in enumerate(dataloader):
         if step >= args.steps:
             break
+
+        # Skip already-trained steps (fast — just iterates the dataloader)
+        if step < resume_step:
+            continue
 
         # Shard batch across devices along batch dimension
         input_ids = jax.device_put(input_ids, data_shard)
@@ -226,19 +255,72 @@ def train_model(model_type, args, config, tokenizer, mesh, print_prefix=""):
 
 
 def save_checkpoint(model, optimizer, step, model_type, args):
-    """Save a checkpoint using orbax."""
+    """Save model state + optimizer state using orbax."""
     try:
         import orbax.checkpoint as ocp
 
         path = os.path.abspath(os.path.join(args.checkpoint_dir, f"{model_type}_step{step}"))
         os.makedirs(path, exist_ok=True)
 
-        _, state = nnx.split(model)
         checkpointer = ocp.StandardCheckpointer()
-        checkpointer.save(os.path.join(path, "state"), state)
+
+        # Model state (used by finetune_glue.py)
+        _, model_state = nnx.split(model)
+        checkpointer.save(os.path.join(path, "state"), model_state)
+
+        # Full optimizer state (model params + Adam momentum/variance + LR step counter)
+        _, opt_state = nnx.split(optimizer)
+        checkpointer.save(os.path.join(path, "optimizer"), opt_state)
+
         print(f"  Checkpoint saved: {path}")
     except ImportError:
         print("  orbax-checkpoint not installed, skipping checkpoint save")
+
+
+def find_latest_checkpoint(checkpoint_dir, model_type):
+    """Find the latest checkpoint step for a model type. Returns step or None."""
+    import re
+    checkpoint_dir = os.path.abspath(checkpoint_dir)
+    if not os.path.isdir(checkpoint_dir):
+        return None
+    pattern = re.compile(rf"^{re.escape(model_type)}_step(\d+)$")
+    max_step = 0
+    for name in os.listdir(checkpoint_dir):
+        m = pattern.match(name)
+        if m:
+            max_step = max(max_step, int(m.group(1)))
+    return max_step if max_step > 0 else None
+
+
+def load_resume_checkpoint(optimizer, checkpoint_dir, model_type):
+    """Load optimizer state (includes model weights) from latest checkpoint.
+
+    Returns the resume step, or 0 if no checkpoint found.
+    """
+    step = find_latest_checkpoint(checkpoint_dir, model_type)
+    if step is None:
+        return 0
+
+    import orbax.checkpoint as ocp
+
+    path = os.path.abspath(os.path.join(checkpoint_dir, f"{model_type}_step{step}"))
+    checkpointer = ocp.StandardCheckpointer()
+
+    opt_path = os.path.join(path, "optimizer")
+    if os.path.exists(opt_path):
+        _, ref = nnx.split(optimizer)
+        restored = checkpointer.restore(opt_path, ref)
+        nnx.update(optimizer, restored)
+        print(f"  Resumed from {path} (step {step}, full optimizer state)")
+    else:
+        # Fallback: old checkpoint without optimizer state
+        state_path = os.path.join(path, "state")
+        _, ref = nnx.split(optimizer.model)
+        restored = checkpointer.restore(state_path, ref)
+        nnx.update(optimizer.model, restored)
+        print(f"  Resumed from {path} (step {step}, model weights only — optimizer reset)")
+
+    return step
 
 
 def main():
@@ -275,6 +357,8 @@ def main():
                         help="Disable SPMD data parallelism (single device). "
                              "Required for --model fused on multi-device TPU "
                              "because Pallas/Mosaic kernels can't be auto-partitioned.")
+    parser.add_argument("--resume", action="store_true",
+                        help="Resume from latest checkpoint in --checkpoint-dir")
     parser.add_argument("--wandb", action="store_true",
                         help="Enable Weights & Biases logging")
     parser.add_argument("--wandb-project", type=str, default="derf-pretrain",

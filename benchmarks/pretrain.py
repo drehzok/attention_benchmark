@@ -130,7 +130,7 @@ def train_model(model_type, args, config, tokenizer, mesh, print_prefix=""):
     # Resume from checkpoint if requested
     resume_step = 0
     if args.resume and args.checkpoint_dir:
-        resume_step = load_resume_checkpoint(optimizer, args.checkpoint_dir, model_type)
+        resume_step = load_resume_checkpoint(model, optimizer, args.checkpoint_dir, model_type)
         if resume_step > 0:
             # Re-replicate restored state across devices
             opt_state = nnx.state(optimizer)
@@ -292,7 +292,7 @@ def find_latest_checkpoint(checkpoint_dir, model_type):
     return max_step if max_step > 0 else None
 
 
-def load_resume_checkpoint(optimizer, checkpoint_dir, model_type):
+def load_resume_checkpoint(model, optimizer, checkpoint_dir, model_type):
     """Load optimizer state (includes model weights) from latest checkpoint.
 
     Returns the resume step, or 0 if no checkpoint found.
@@ -315,9 +315,9 @@ def load_resume_checkpoint(optimizer, checkpoint_dir, model_type):
     else:
         # Fallback: old checkpoint without optimizer state
         state_path = os.path.join(path, "state")
-        _, ref = nnx.split(optimizer.model)
+        _, ref = nnx.split(model)
         restored = checkpointer.restore(state_path, ref)
-        nnx.update(optimizer.model, restored)
+        nnx.update(model, restored)
         print(f"  Resumed from {path} (step {step}, model weights only — optimizer reset)")
 
     return step

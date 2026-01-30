@@ -139,3 +139,86 @@ def create_dataloader(dataset, batch_size, tokenizer, mlm_prob=0.15, seed=42,
         if item is None:
             break
         yield item
+
+
+# ---------------------------------------------------------------------------
+# GLUE task loading (SST-2, MNLI)
+# ---------------------------------------------------------------------------
+
+GLUE_TASKS = {
+    "sst2": {"num_classes": 2, "sentence_keys": ("sentence",)},
+    "mnli": {"num_classes": 3, "sentence_keys": ("premise", "hypothesis")},
+}
+
+
+def load_glue_task(task_name, tokenizer, seq_len=128, split="train"):
+    """Load a GLUE task and return tokenized examples.
+
+    Args:
+        task_name: "sst2" or "mnli"
+        tokenizer: HuggingFace tokenizer
+        seq_len: max sequence length (pad/truncate)
+        split: dataset split ("train", "validation", "validation_matched",
+               "validation_mismatched")
+
+    Returns:
+        input_ids: np.ndarray (num_examples, seq_len)
+        labels: np.ndarray (num_examples,)
+    """
+    from datasets import load_dataset
+
+    task_info = GLUE_TASKS[task_name]
+    ds = load_dataset("glue", task_name, split=split)
+
+    all_input_ids = []
+    all_labels = []
+
+    keys = task_info["sentence_keys"]
+    for example in ds:
+        if len(keys) == 1:
+            encoded = tokenizer(
+                example[keys[0]],
+                max_length=seq_len,
+                padding="max_length",
+                truncation=True,
+                return_attention_mask=False,
+            )
+        else:
+            encoded = tokenizer(
+                example[keys[0]],
+                example[keys[1]],
+                max_length=seq_len,
+                padding="max_length",
+                truncation=True,
+                return_attention_mask=False,
+            )
+
+        all_input_ids.append(encoded["input_ids"])
+        all_labels.append(example["label"])
+
+    return np.array(all_input_ids, dtype=np.int32), np.array(all_labels, dtype=np.int32)
+
+
+def create_glue_dataloader(input_ids, labels, batch_size, shuffle=True, seed=42):
+    """Yield batches of (input_ids, labels) as JAX arrays.
+
+    Args:
+        input_ids: np.ndarray (num_examples, seq_len)
+        labels: np.ndarray (num_examples,)
+        batch_size: examples per batch
+        shuffle: whether to shuffle each epoch
+        seed: random seed for shuffling
+
+    Yields:
+        (input_ids_batch, labels_batch) as jnp.ndarray
+    """
+    n = len(labels)
+    rng = np.random.default_rng(seed)
+
+    indices = np.arange(n)
+    if shuffle:
+        rng.shuffle(indices)
+
+    for start in range(0, n - batch_size + 1, batch_size):
+        idx = indices[start:start + batch_size]
+        yield jnp.array(input_ids[idx]), jnp.array(labels[idx])

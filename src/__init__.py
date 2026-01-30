@@ -15,6 +15,7 @@ from .models import (
     DerfBert,
     FusedTransformerBlock,
     FusedDerfBert,
+    BertForSequenceClassification,
 )
 from .kernels import fused_derf_linear, pallas_matmul
 from .utils import BenchmarkTimer, generate_random_inputs, setup_logger, warmup_jit

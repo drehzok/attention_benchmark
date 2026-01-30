@@ -310,19 +310,16 @@ class NormalBert(nnx.Module):
 
         self.head = nnx.Linear(dim, vocab_size, rngs=rngs)
 
-    def __call__(self, input_ids: jax.Array, mask: jax.Array = None, deterministic: bool = False) -> jax.Array:
+    def encode(self, input_ids: jax.Array, mask: jax.Array = None, deterministic: bool = False) -> jax.Array:
         seq_len = input_ids.shape[1]
-
         pos_ids = jnp.arange(seq_len)[None, :]
         x = self.embed(input_ids) + self.pos_embed(pos_ids)
-
         for layer in self.layers:
             x = layer(x, mask, deterministic=deterministic)
+        return self.final_norm(x)
 
-        x = self.final_norm(x)
-        logits = self.head(x)
-
-        return logits
+    def __call__(self, input_ids: jax.Array, mask: jax.Array = None, deterministic: bool = False) -> jax.Array:
+        return self.head(self.encode(input_ids, mask, deterministic))
 
 
 class DerfBert(nnx.Module):
@@ -350,19 +347,16 @@ class DerfBert(nnx.Module):
 
         self.head = nnx.Linear(dim, vocab_size, rngs=rngs)
 
-    def __call__(self, input_ids: jax.Array, mask: jax.Array = None, deterministic: bool = False) -> jax.Array:
+    def encode(self, input_ids: jax.Array, mask: jax.Array = None, deterministic: bool = False) -> jax.Array:
         seq_len = input_ids.shape[1]
-
         pos_ids = jnp.arange(seq_len)[None, :]
         x = self.embed(input_ids) + self.pos_embed(pos_ids)
-
         for layer in self.layers:
             x = layer(x, mask, deterministic=deterministic)
+        return self.final_norm(x)
 
-        x = self.final_norm(x)
-        logits = self.head(x)
-
-        return logits
+    def __call__(self, input_ids: jax.Array, mask: jax.Array = None, deterministic: bool = False) -> jax.Array:
+        return self.head(self.encode(input_ids, mask, deterministic))
 
 
 # ---------------------------------------------------------------------------
@@ -373,9 +367,14 @@ class FusedTransformerBlock(nnx.Module):
 
     Fuses norm1+QKV and norm2+fc1 into single kernels that keep the Derf
     intermediate in VMEM, avoiding HBM roundtrips.
+
+    Args:
+        mesh: Optional JAX Mesh for data-parallel shard_map wrapping.
+              When provided with >1 device, Pallas calls are wrapped in
+              shard_map so GSPMD doesn't try to auto-partition them.
     """
 
-    def __init__(self, dim: int, num_heads: int, mlp_dim: int, dropout_rate: float, rngs: nnx.Rngs):
+    def __init__(self, dim: int, num_heads: int, mlp_dim: int, dropout_rate: float, rngs: nnx.Rngs, mesh=None):
         self.dim = dim
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
@@ -392,14 +391,42 @@ class FusedTransformerBlock(nnx.Module):
         self.mlp_fc2 = nnx.Linear(mlp_dim, dim, rngs=rngs)
         self.dropout2 = nnx.Dropout(dropout_rate, rngs=rngs)
 
-    def __call__(self, x: jax.Array, mask: jax.Array = None, deterministic: bool = False) -> jax.Array:
+        # shard_map wrapping for multi-device Pallas
+        self._derf_linear_fn = self._make_derf_linear(mesh)
+
+    @staticmethod
+    def _make_derf_linear(mesh):
+        """Return fused_derf_linear, optionally wrapped in shard_map."""
         from .kernels import fused_derf_linear
 
+        if mesh is not None and mesh.devices.size > 1:
+            from jax.experimental.shard_map import shard_map
+            from jax.sharding import PartitionSpec as P
+
+            return shard_map(
+                fused_derf_linear,
+                mesh=mesh,
+                in_specs=(
+                    P('dp', None, None),  # x:      (batch, seq, dim) sharded on batch
+                    P(),                   # weight: replicated
+                    P(),                   # bias:   replicated
+                    P(),                   # alpha:  replicated scalar
+                    P(),                   # s:      replicated scalar
+                    P(),                   # gamma:  replicated
+                    P(),                   # beta:   replicated
+                ),
+                out_specs=P('dp', None, None),
+                check_rep=False,
+            )
+
+        return fused_derf_linear
+
+    def __call__(self, x: jax.Array, mask: jax.Array = None, deterministic: bool = False) -> jax.Array:
         batch, seq_len, dim = x.shape
         resid = x
 
         # Fused Derf + QKV projection
-        qkv = fused_derf_linear(
+        qkv = self._derf_linear_fn(
             x,
             self.w_qkv.kernel[...],
             self.w_qkv.bias[...],
@@ -421,7 +448,7 @@ class FusedTransformerBlock(nnx.Module):
         # Fused Derf + fc1
         resid = x
 
-        hidden = fused_derf_linear(
+        hidden = self._derf_linear_fn(
             x,
             self.mlp_fc1.kernel[...],
             self.mlp_fc1.bias[...],
@@ -438,7 +465,13 @@ class FusedTransformerBlock(nnx.Module):
 
 
 class FusedDerfBert(nnx.Module):
-    """DerfBert using FusedTransformerBlock for Pallas kernel fusion."""
+    """DerfBert using FusedTransformerBlock for Pallas kernel fusion.
+
+    Args:
+        mesh: Optional JAX Mesh for data-parallel shard_map wrapping.
+              Pass the training mesh on multi-device TPU so Pallas kernels
+              are wrapped in shard_map (GSPMD can't auto-partition Mosaic).
+    """
 
     def __init__(
         self,
@@ -449,6 +482,7 @@ class FusedDerfBert(nnx.Module):
         mlp_dim: int,
         dropout_rate: float,
         rngs: nnx.Rngs,
+        mesh=None,
     ):
         self.dim = dim
         self.num_layers = num_layers
@@ -458,22 +492,40 @@ class FusedDerfBert(nnx.Module):
         self.final_norm = Derf(dim, rngs)
 
         self.layers = nnx.List([
-            FusedTransformerBlock(dim, num_heads, mlp_dim, dropout_rate, rngs)
+            FusedTransformerBlock(dim, num_heads, mlp_dim, dropout_rate, rngs, mesh=mesh)
             for _ in range(num_layers)
         ])
 
         self.head = nnx.Linear(dim, vocab_size, rngs=rngs)
 
-    def __call__(self, input_ids: jax.Array, mask: jax.Array = None, deterministic: bool = False) -> jax.Array:
+    def encode(self, input_ids: jax.Array, mask: jax.Array = None, deterministic: bool = False) -> jax.Array:
         seq_len = input_ids.shape[1]
-
         pos_ids = jnp.arange(seq_len)[None, :]
         x = self.embed(input_ids) + self.pos_embed(pos_ids)
-
         for layer in self.layers:
             x = layer(x, mask, deterministic=deterministic)
+        return self.final_norm(x)
 
-        x = self.final_norm(x)
-        logits = self.head(x)
+    def __call__(self, input_ids: jax.Array, mask: jax.Array = None, deterministic: bool = False) -> jax.Array:
+        return self.head(self.encode(input_ids, mask, deterministic))
 
-        return logits
+
+# ---------------------------------------------------------------------------
+# Classification wrapper for GLUE fine-tuning
+# ---------------------------------------------------------------------------
+class BertForSequenceClassification(nnx.Module):
+    """Wraps any BERT variant with a classification head for fine-tuning.
+
+    Uses [CLS] token (position 0) pooling.
+    """
+
+    def __init__(self, bert, num_classes: int, dropout_rate: float, rngs: nnx.Rngs):
+        self.bert = bert
+        self.dropout = nnx.Dropout(dropout_rate)
+        self.classifier = nnx.Linear(bert.dim, num_classes, rngs=rngs)
+
+    def __call__(self, input_ids: jax.Array, mask: jax.Array = None, deterministic: bool = False) -> jax.Array:
+        hidden = self.bert.encode(input_ids, mask, deterministic)
+        cls_output = hidden[:, 0, :]
+        cls_output = self.dropout(cls_output, deterministic=deterministic)
+        return self.classifier(cls_output)

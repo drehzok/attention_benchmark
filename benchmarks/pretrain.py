@@ -4,6 +4,10 @@ Usage:
     python benchmarks/pretrain.py --model derf --size base
     python benchmarks/pretrain.py --model normal --size small
     python benchmarks/pretrain.py --model both --size base
+
+    # Use --no-shard for the fused model on multi-device TPU
+    # (Pallas/Mosaic kernels can't be auto-partitioned by GSPMD)
+    python benchmarks/pretrain.py --model fused --size base --no-shard
 """
 
 import argparse
@@ -28,10 +32,10 @@ CONFIGS = {
 }
 
 
-def create_model(model_type, config, vocab_size, dropout_rate, rngs):
+def create_model(model_type, config, vocab_size, dropout_rate, rngs, mesh=None):
     """Instantiate DerfBert, NormalBert, or FusedDerfBert based on model_type string."""
     cls = {"derf": DerfBert, "normal": NormalBert, "fused": FusedDerfBert}[model_type]
-    return cls(
+    kwargs = dict(
         vocab_size=vocab_size,
         num_layers=config["num_layers"],
         dim=config["dim"],
@@ -40,6 +44,9 @@ def create_model(model_type, config, vocab_size, dropout_rate, rngs):
         dropout_rate=dropout_rate,
         rngs=rngs,
     )
+    if model_type == "fused":
+        kwargs["mesh"] = mesh
+    return cls(**kwargs)
 
 
 def count_params(model):
@@ -101,7 +108,7 @@ def train_model(model_type, args, config, tokenizer, mesh, print_prefix=""):
     data_shard = NamedSharding(mesh, P('dp'))
 
     rngs = nnx.Rngs(args.seed)
-    model = create_model(model_type, config, tokenizer.vocab_size, args.dropout, rngs)
+    model = create_model(model_type, config, tokenizer.vocab_size, args.dropout, rngs, mesh=mesh)
     n_params = count_params(model)
     print(f"Parameters: {n_params:,}")
 
@@ -125,8 +132,9 @@ def train_model(model_type, args, config, tokenizer, mesh, print_prefix=""):
         dataset, args.batch_size, tokenizer, mlm_prob=args.mlm_prob, seed=args.seed
     )
 
+    n_mesh_devices = len(mesh.devices.flat)
     print(f"Starting training for {args.steps} steps "
-          f"(data-parallel across {len(mesh.devices)} devices)...")
+          f"({'single device' if n_mesh_devices == 1 else f'data-parallel across {n_mesh_devices} devices'})...")
     total_tokens = 0
     start_time = time.perf_counter()
     step_times = []
@@ -229,6 +237,10 @@ def main():
                         help="Checkpoint every N steps (default: 1000)")
     parser.add_argument("--seed", type=int, default=42,
                         help="Random seed (default: 42)")
+    parser.add_argument("--no-shard", action="store_true",
+                        help="Disable SPMD data parallelism (single device). "
+                             "Required for --model fused on multi-device TPU "
+                             "because Pallas/Mosaic kernels can't be auto-partitioned.")
     args = parser.parse_args()
 
     # Multi-host TPU initialization (skip on single-host Colab/Kaggle)
@@ -240,22 +252,34 @@ def main():
     devices = jax.devices()
     num_devices = len(devices)
     import numpy as np
-    mesh = Mesh(np.array(devices), axis_names=('dp',))
 
-    if args.batch_size % num_devices != 0:
+    if args.no_shard:
+        mesh_devices = np.array([devices[0]])
+        mesh = Mesh(mesh_devices, axis_names=('dp',))
+        num_mesh_devices = 1
+    else:
+        mesh_devices = np.array(devices)
+        mesh = Mesh(mesh_devices, axis_names=('dp',))
+        num_mesh_devices = num_devices
+
+    if args.batch_size % num_mesh_devices != 0:
         old_bs = args.batch_size
-        args.batch_size = (args.batch_size // num_devices) * num_devices
+        args.batch_size = (args.batch_size // num_mesh_devices) * num_mesh_devices
         if args.batch_size == 0:
-            args.batch_size = num_devices
-        print(f"  Adjusted batch size {old_bs} -> {args.batch_size} (divisible by {num_devices} devices)")
+            args.batch_size = num_mesh_devices
+        print(f"  Adjusted batch size {old_bs} -> {args.batch_size} (divisible by {num_mesh_devices} mesh devices)")
 
     print("BERT Pretraining Benchmark: Derf vs LayerNorm")
     print(f"  JAX devices:   {devices}")
     print(f"  Device count:  {num_devices}")
+    if args.no_shard:
+        print(f"  Sharding:      DISABLED (single device: {devices[0]})")
+    else:
+        print(f"  Sharding:      data-parallel across {num_mesh_devices} devices")
     print(f"  Model size:    {args.size}")
     print(f"  Config:        {CONFIGS[args.size]}")
     print(f"  Steps:         {args.steps}")
-    print(f"  Batch size:    {args.batch_size} ({args.batch_size // num_devices} per device)")
+    print(f"  Batch size:    {args.batch_size} ({args.batch_size // num_mesh_devices} per device)")
     print(f"  Seq length:    {args.seq_len}")
     print(f"  Learning rate: {args.lr}")
 

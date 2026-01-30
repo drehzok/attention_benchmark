@@ -277,19 +277,35 @@ def save_checkpoint(model, optimizer, step, model_type, args):
         print("  orbax-checkpoint not installed, skipping checkpoint save")
 
 
+def _checkpoint_is_valid(checkpoint_path):
+    """Check that a checkpoint dir has finalized data (not just .orbax-checkpoint-tmp)."""
+    if not os.path.isdir(checkpoint_path):
+        return False
+    # Valid if it has a finalized 'optimizer' or 'state' subdirectory
+    return (os.path.isdir(os.path.join(checkpoint_path, "optimizer"))
+            or os.path.isdir(os.path.join(checkpoint_path, "state")))
+
+
 def find_latest_checkpoint(checkpoint_dir, model_type):
-    """Find the latest checkpoint step for a model type. Returns step or None."""
+    """Find the latest valid checkpoint step for a model type. Returns step or None."""
     import re
     checkpoint_dir = os.path.abspath(checkpoint_dir)
     if not os.path.isdir(checkpoint_dir):
         return None
     pattern = re.compile(rf"^{re.escape(model_type)}_step(\d+)$")
-    max_step = 0
+    steps = []
     for name in os.listdir(checkpoint_dir):
         m = pattern.match(name)
         if m:
-            max_step = max(max_step, int(m.group(1)))
-    return max_step if max_step > 0 else None
+            steps.append(int(m.group(1)))
+    # Check from newest to oldest, return first valid one
+    for step in sorted(steps, reverse=True):
+        path = os.path.join(checkpoint_dir, f"{model_type}_step{step}")
+        if _checkpoint_is_valid(path):
+            return step
+        else:
+            print(f"  Skipping incomplete checkpoint: {path}")
+    return None
 
 
 def load_resume_checkpoint(model, optimizer, checkpoint_dir, model_type):

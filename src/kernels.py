@@ -234,38 +234,41 @@ def _fused_derf_kernel(x_ref, w_ref, alpha_ref, s_ref, gamma_ref, beta_ref,
         out_ref[...] += partial
 
 
+def _vmem_estimate(bm, bk, N):
+    """Estimate total VMEM usage for (bm, bk, N) tile config.
+
+    Mosaic double-buffers all tiled inputs/outputs for DMA pipelining,
+    and the kernel body creates intermediate arrays (normed, u, bf16 casts).
+    """
+    B = 4  # bytes per f32 element
+    # Double-buffered tiles: x, weight, output
+    double_buf = 2 * (bm * bk + bk * N + bm * N) * B
+    # Kernel intermediates: u, erf_approx, normed, bf16 casts (~3 x-sized)
+    intermediates = 3 * bm * bk * B
+    # Compiler scratch (params, small buffers, alignment padding)
+    scratch = 1 * 1024 * 1024
+    return double_buf + intermediates + scratch
+
+
+_VMEM_CAPACITY = 16 * 1024 * 1024   # TPU v3+ VMEM per core
+
+
 def _choose_block_sizes(M, K, N):
     """Pick (BM, BK) to maximise tile size while fitting in VMEM.
 
     Strategy: use BK = K (full reduction in one tile) when possible,
-    then pick the largest BM that keeps total VMEM usage under the
-    budget.  Larger tiles → fewer grid points, better MXU utilisation,
-    and the full-K tile means derf is computed exactly once per M-tile.
-
-    VMEM budget per tile (conservative, leaves room for double-buffering):
-        x:   BM * BK * 4          (f32)
-        w:   BK * N  * 4          (f32, full N width)
-        out: BM * N  * 4          (f32, full N width)
-        overhead: ~1 MB           (params, intermediates, compiler scratch)
+    then pick the largest BM that keeps total VMEM under capacity.
+    Larger tiles → fewer grid points, better MXU utilisation,
+    and fewer K tiles means derf is computed fewer times per M-tile.
     """
-    vmem_budget = 14 * 1024 * 1024   # 14 MB — safe for 16 MB VMEM TPU v3+
-
-    # Try BK = full K first (eliminates K loop entirely).
+    # Try BK from largest to smallest, BM from largest to smallest.
     for bk in [K, 512, 384, 256, _BK]:
         if K % bk != 0:
             continue
-        # Weight tile: (bk, N) — fixed cost per BK choice
-        w_bytes = bk * N * 4
-        if w_bytes > vmem_budget:
-            continue
-        remaining = vmem_budget - w_bytes
-        # For a given bk, find largest BM (multiple of 128) that fits.
         for bm in [512, 256, _BM]:
             if M % bm != 0:
                 continue
-            x_bytes   = bm * bk * 4
-            out_bytes = bm * N  * 4
-            if x_bytes + out_bytes <= remaining:
+            if _vmem_estimate(bm, bk, N) <= _VMEM_CAPACITY:
                 return bm, bk
     return _BM, _BK
 

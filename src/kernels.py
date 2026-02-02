@@ -82,9 +82,9 @@ def _pallas_matmul_2d(a, b):
 def _can_use_pallas(M, K, N):
     return (
         jax.default_backend() == "tpu"
-        and M % _BM == 0
-        and K % _BK == 0
-        and N % _BN == 0
+        and M % _BM == 0   # M must be divisible by smallest BM (128)
+        and K % _BK == 0   # K must be divisible by smallest BK (128)
+        and N % _BN == 0   # N must be 128-aligned for MXU
     )
 
 
@@ -234,15 +234,52 @@ def _fused_derf_kernel(x_ref, w_ref, alpha_ref, s_ref, gamma_ref, beta_ref,
         out_ref[...] += partial
 
 
+def _choose_block_sizes(M, K, N):
+    """Pick (BM, BK) to maximise tile size while fitting in VMEM.
+
+    Strategy: use BK = K (full reduction in one tile) when possible,
+    then pick the largest BM that keeps total VMEM usage under the
+    budget.  Larger tiles → fewer grid points, better MXU utilisation,
+    and the full-K tile means derf is computed exactly once per M-tile.
+
+    VMEM budget per tile (conservative, leaves room for double-buffering):
+        x:   BM * BK * 4          (f32)
+        w:   BK * N  * 4          (f32, full N width)
+        out: BM * N  * 4          (f32, full N width)
+        overhead: ~1 MB           (params, intermediates, compiler scratch)
+    """
+    vmem_budget = 14 * 1024 * 1024   # 14 MB — safe for 16 MB VMEM TPU v3+
+
+    # Try BK = full K first (eliminates K loop entirely).
+    for bk in [K, 512, 384, 256, _BK]:
+        if K % bk != 0:
+            continue
+        # Weight tile: (bk, N) — fixed cost per BK choice
+        w_bytes = bk * N * 4
+        if w_bytes > vmem_budget:
+            continue
+        remaining = vmem_budget - w_bytes
+        # For a given bk, find largest BM (multiple of 128) that fits.
+        for bm in [512, 256, _BM]:
+            if M % bm != 0:
+                continue
+            x_bytes   = bm * bk * 4
+            out_bytes = bm * N  * 4
+            if x_bytes + out_bytes <= remaining:
+                return bm, bk
+    return _BM, _BK
+
+
 def _pallas_forward(x_2d, weight, bias, alpha, s, gamma, beta):
     """Invoke the Pallas kernel.  x_2d: (M, K), weight: (K, N).
 
-    Uses a 2D grid (M, K) instead of 3D (M, N, K).  Each tile loads
-    the full N-width of the weight matrix, eliminating redundant derf
-    recomputation across N tiles and reducing total grid points by N/BN.
+    Uses a 2D grid (M, K) with adaptive tile sizes.  Prefers BK = K
+    (full reduction in one tile, no K loop) and the largest BM that
+    fits in VMEM.  Weight and output tiles span the full N width.
     """
     M, K = x_2d.shape
     N = weight.shape[1]
+    bm, bk = _choose_block_sizes(M, K, N)
 
     alpha_2d = jnp.array([[alpha]], dtype=jnp.float32)   # (1, 1)
     s_2d     = jnp.array([[s]],     dtype=jnp.float32)   # (1, 1)
@@ -250,25 +287,29 @@ def _pallas_forward(x_2d, weight, bias, alpha, s, gamma, beta):
     beta_2d  = beta.reshape(1, K)                         # (1, K)
     bias_2d  = bias.reshape(1, N)                         # (1, N)
 
+    k_tiles = K // bk
+    # When K fits in a single tile, no reduction loop — use "parallel".
+    k_sem = "parallel" if k_tiles == 1 else "arbitrary"
+
     return pl.pallas_call(
         _fused_derf_kernel,
         out_shape=jax.ShapeDtypeStruct((M, N), jnp.float32),
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=0,
             in_specs=[
-                pl.BlockSpec((_BM, _BK), lambda m, k: (m, k)),  # x
-                pl.BlockSpec((_BK, N),   lambda m, k: (k, 0)),  # weight (full N)
-                pl.BlockSpec((1, 1),     lambda m, k: (0, 0)),   # alpha
-                pl.BlockSpec((1, 1),     lambda m, k: (0, 0)),   # s
-                pl.BlockSpec((1, _BK),   lambda m, k: (0, k)),   # gamma
-                pl.BlockSpec((1, _BK),   lambda m, k: (0, k)),   # beta
-                pl.BlockSpec((1, N),     lambda m, k: (0, 0)),   # bias (full N)
+                pl.BlockSpec((bm, bk), lambda m, k: (m, k)),  # x
+                pl.BlockSpec((bk, N),  lambda m, k: (k, 0)),  # weight (full N)
+                pl.BlockSpec((1, 1),   lambda m, k: (0, 0)),   # alpha
+                pl.BlockSpec((1, 1),   lambda m, k: (0, 0)),   # s
+                pl.BlockSpec((1, bk),  lambda m, k: (0, k)),   # gamma
+                pl.BlockSpec((1, bk),  lambda m, k: (0, k)),   # beta
+                pl.BlockSpec((1, N),   lambda m, k: (0, 0)),   # bias (full N)
             ],
-            out_specs=pl.BlockSpec((_BM, N), lambda m, k: (m, 0)),
-            grid=(M // _BM, K // _BK),
+            out_specs=pl.BlockSpec((bm, N), lambda m, k: (m, 0)),
+            grid=(M // bm, k_tiles),
         ),
         compiler_params=pltpu.CompilerParams(
-            dimension_semantics=("parallel", "arbitrary"),
+            dimension_semantics=("parallel", k_sem),
         ),
     )(x_2d, weight, alpha_2d, s_2d, gamma_2d, beta_2d, bias_2d)
 

@@ -3,6 +3,10 @@
 Block sizes (128, 128) are the LCM of VPU-optimal (8, 128) and MXU-optimal
 (128, 128), giving good utilisation on both processing units.
 
+The fused derf kernel uses a 2D grid (M, K) with full-N-width weight tiles,
+so derf is computed once per (m, k) pair and the MXU uses bf16 inputs with
+f32 accumulation for ~2x throughput.
+
 Public API:
     pallas_matmul       — y = x @ w + bias   (Pallas fwd + bwd on TPU)
     fused_derf_linear   — y = (γ·erf(α·x+s)+β) @ w + bias  (Pallas fwd, JAX bwd)
@@ -181,37 +185,44 @@ def _fused_derf_kernel(x_ref, w_ref, alpha_ref, s_ref, gamma_ref, beta_ref,
                        bias_ref, out_ref):
     """Fused derf + matmul kernel body.
 
-    All parameters use BlockSpec tiling (no scalar_prefetch):
+    Grid: (M//BM, K//BK) — N is NOT a grid dimension.
+    Weight and output tiles span the full N width, so derf is computed
+    only once per (m, k) pair.  The MXU uses bf16 inputs with f32
+    accumulation for ~2x throughput vs the previous f32-only version.
+
+    Block shapes:
         x_ref:     (BM, BK) — tiled along M and K
-        w_ref:     (BK, BN) — tiled along K and N
+        w_ref:     (BK, N)  — full N width, tiled along K only
         alpha_ref: (1, 1)   — scalar broadcast
         s_ref:     (1, 1)   — scalar broadcast
         gamma_ref: (1, BK)  — tiled along K, broadcasts along M
         beta_ref:  (1, BK)  — tiled along K, broadcasts along M
-        bias_ref:  (1, BN)  — tiled along N, broadcasts along M
+        bias_ref:  (1, N)   — full N width
+        out_ref:   (BM, N)  — full N width, tiled along M only
     """
-    k_iter = pl.program_id(2)
+    k_iter = pl.program_id(1)
 
     x_blk = x_ref[...].astype(jnp.float32)          # (BM, BK)
-    w_blk = w_ref[...].astype(jnp.float32)          # (BK, BN)
+    w_blk = w_ref[...]                               # (BK, N)
     alpha = alpha_ref[...].astype(jnp.float32)       # (1, 1)
     s     = s_ref[...].astype(jnp.float32)           # (1, 1)
     gamma = gamma_ref[...].astype(jnp.float32)       # (1, BK)
     beta  = beta_ref[...].astype(jnp.float32)        # (1, BK)
-    bias  = bias_ref[...].astype(jnp.float32)        # (1, BN)
+    bias  = bias_ref[...].astype(jnp.float32)        # (1, N)
 
-    # ---- Fused Derf (VPU) ----
+    # ---- Fused Derf (VPU, f32) ----
     # erf(x) ≈ tanh(2/√π · (x + 0.08943·x³))  (lax.erf has no Pallas lowering)
     u = alpha * x_blk + s                            # (BM, BK)
     erf_approx = lax.tanh(_TWO_OVER_SQRT_PI * (u + _ERF_COEFF * u * u * u))
     normed = gamma * erf_approx + beta               # (BM, BK)
 
-    # ---- Matmul (MXU) ----
+    # ---- Matmul (MXU, bf16 inputs → f32 accumulation) ----
     partial = lax.dot_general(
-        normed, w_blk,
+        normed.astype(jnp.bfloat16),
+        w_blk.astype(jnp.bfloat16),
         dimension_numbers=_MATMUL_DIMS,
         preferred_element_type=jnp.float32,
-    )                                                # (BM, BN)
+    )                                                # (BM, N)
 
     # ---- Accumulate ----
     @pl.when(k_iter == 0)
@@ -224,13 +235,15 @@ def _fused_derf_kernel(x_ref, w_ref, alpha_ref, s_ref, gamma_ref, beta_ref,
 
 
 def _pallas_forward(x_2d, weight, bias, alpha, s, gamma, beta):
-    """Invoke the Pallas kernel.  x_2d: (M, K), weight: (K, N)."""
+    """Invoke the Pallas kernel.  x_2d: (M, K), weight: (K, N).
+
+    Uses a 2D grid (M, K) instead of 3D (M, N, K).  Each tile loads
+    the full N-width of the weight matrix, eliminating redundant derf
+    recomputation across N tiles and reducing total grid points by N/BN.
+    """
     M, K = x_2d.shape
     N = weight.shape[1]
 
-    # Reshape all params to 2D for proper BlockSpec tiling.
-    # Scalars -> (1, 1), vectors -> (1, length).
-    # Block dim[-2]=1 == array dim[-2]=1 satisfies TPU alignment.
     alpha_2d = jnp.array([[alpha]], dtype=jnp.float32)   # (1, 1)
     s_2d     = jnp.array([[s]],     dtype=jnp.float32)   # (1, 1)
     gamma_2d = gamma.reshape(1, K)                        # (1, K)
@@ -243,19 +256,19 @@ def _pallas_forward(x_2d, weight, bias, alpha, s, gamma, beta):
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=0,
             in_specs=[
-                pl.BlockSpec((_BM, _BK), lambda m, n, k: (m, k)),  # x
-                pl.BlockSpec((_BK, _BN), lambda m, n, k: (k, n)),  # weight
-                pl.BlockSpec((1, 1),     lambda m, n, k: (0, 0)),   # alpha
-                pl.BlockSpec((1, 1),     lambda m, n, k: (0, 0)),   # s
-                pl.BlockSpec((1, _BK),   lambda m, n, k: (0, k)),   # gamma
-                pl.BlockSpec((1, _BK),   lambda m, n, k: (0, k)),   # beta
-                pl.BlockSpec((1, _BN),   lambda m, n, k: (0, n)),   # bias
+                pl.BlockSpec((_BM, _BK), lambda m, k: (m, k)),  # x
+                pl.BlockSpec((_BK, N),   lambda m, k: (k, 0)),  # weight (full N)
+                pl.BlockSpec((1, 1),     lambda m, k: (0, 0)),   # alpha
+                pl.BlockSpec((1, 1),     lambda m, k: (0, 0)),   # s
+                pl.BlockSpec((1, _BK),   lambda m, k: (0, k)),   # gamma
+                pl.BlockSpec((1, _BK),   lambda m, k: (0, k)),   # beta
+                pl.BlockSpec((1, N),     lambda m, k: (0, 0)),   # bias (full N)
             ],
-            out_specs=pl.BlockSpec((_BM, _BN), lambda m, n, k: (m, n)),
-            grid=(M // _BM, N // _BN, K // _BK),
+            out_specs=pl.BlockSpec((_BM, N), lambda m, k: (m, 0)),
+            grid=(M // _BM, K // _BK),
         ),
         compiler_params=pltpu.CompilerParams(
-            dimension_semantics=("parallel", "parallel", "arbitrary"),
+            dimension_semantics=("parallel", "arbitrary"),
         ),
     )(x_2d, weight, alpha_2d, s_2d, gamma_2d, beta_2d, bias_2d)
 

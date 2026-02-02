@@ -360,6 +360,102 @@ class DerfBert(nnx.Module):
 
 
 # ---------------------------------------------------------------------------
+# Unfused QKV Derf models (same arch as Fused, but no Pallas kernel)
+# ---------------------------------------------------------------------------
+class UnfusedQKVTransformerBlock(nnx.Module):
+    """Same architecture as FusedTransformerBlock (combined QKV projection +
+    jax.nn.dot_product_attention) but without Pallas kernel fusion.
+
+    This isolates the architectural differences from the kernel fusion effect.
+    """
+
+    def __init__(self, dim: int, num_heads: int, mlp_dim: int, dropout_rate: float, rngs: nnx.Rngs):
+        self.dim = dim
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+
+        # Attention path
+        self.norm1 = Derf(dim, rngs)
+        self.w_qkv = nnx.Linear(dim, 3 * dim, rngs=rngs)
+        self.w_o = nnx.Linear(dim, dim, rngs=rngs)
+        self.dropout1 = nnx.Dropout(dropout_rate, rngs=rngs)
+
+        # MLP path
+        self.norm2 = Derf(dim, rngs)
+        self.mlp_fc1 = nnx.Linear(dim, mlp_dim, rngs=rngs)
+        self.mlp_fc2 = nnx.Linear(mlp_dim, dim, rngs=rngs)
+        self.dropout2 = nnx.Dropout(dropout_rate, rngs=rngs)
+
+    def __call__(self, x: jax.Array, mask: jax.Array = None, deterministic: bool = False) -> jax.Array:
+        batch, seq_len, dim = x.shape
+        resid = x
+
+        # Separate Derf + QKV projection (no Pallas fusion)
+        x = self.norm1(x)
+        qkv = self.w_qkv(x)
+        qkv = qkv.reshape(batch, seq_len, 3, self.num_heads, self.head_dim)
+        q, k, v = qkv[:, :, 0], qkv[:, :, 1], qkv[:, :, 2]
+
+        attn_out = jax.nn.dot_product_attention(q, k, v, mask=mask)
+        attn_out = attn_out.reshape(batch, seq_len, dim)
+
+        x = resid + self.dropout1(self.w_o(attn_out), deterministic=deterministic)
+
+        # Separate Derf + fc1 (no Pallas fusion)
+        resid = x
+        hidden = self.norm2(x)
+        hidden = self.mlp_fc1(hidden)
+        hidden = jax.nn.gelu(hidden)
+        hidden = self.mlp_fc2(hidden)
+        x = resid + self.dropout2(hidden, deterministic=deterministic)
+
+        return x
+
+
+class UnfusedQKVBert(nnx.Module):
+    """Same architecture as FusedDerfBert but without Pallas kernel fusion.
+
+    Useful for isolating the effect of the Pallas kernel vs the architectural
+    changes (combined QKV + jax.nn.dot_product_attention).
+    """
+
+    def __init__(
+        self,
+        vocab_size: int,
+        num_layers: int,
+        dim: int,
+        num_heads: int,
+        mlp_dim: int,
+        dropout_rate: float,
+        rngs: nnx.Rngs,
+    ):
+        self.dim = dim
+        self.num_layers = num_layers
+
+        self.embed = nnx.Embed(vocab_size, dim, rngs=rngs)
+        self.pos_embed = nnx.Embed(512, dim, rngs=rngs)
+        self.final_norm = Derf(dim, rngs)
+
+        self.layers = nnx.List([
+            UnfusedQKVTransformerBlock(dim, num_heads, mlp_dim, dropout_rate, rngs)
+            for _ in range(num_layers)
+        ])
+
+        self.head = nnx.Linear(dim, vocab_size, rngs=rngs)
+
+    def encode(self, input_ids: jax.Array, mask: jax.Array = None, deterministic: bool = False) -> jax.Array:
+        seq_len = input_ids.shape[1]
+        pos_ids = jnp.arange(seq_len)[None, :]
+        x = self.embed(input_ids) + self.pos_embed(pos_ids)
+        for layer in self.layers:
+            x = layer(x, mask, deterministic=deterministic)
+        return self.final_norm(x)
+
+    def __call__(self, input_ids: jax.Array, mask: jax.Array = None, deterministic: bool = False) -> jax.Array:
+        return self.head(self.encode(input_ids, mask, deterministic))
+
+
+# ---------------------------------------------------------------------------
 # Fused Derf models (Pallas kernel fusion)
 # ---------------------------------------------------------------------------
 class FusedTransformerBlock(nnx.Module):

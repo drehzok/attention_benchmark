@@ -1,7 +1,13 @@
-"""Inference speed benchmark: Derf vs LayerNorm vs Fused Derf.
+"""Inference speed benchmark: Derf vs LayerNorm vs Fused Derf vs Unfused QKV.
 
-Measures forward-pass-only throughput to isolate the fused Pallas kernel
-speedup (backward uses JAX for all models).
+Measures forward-pass-only throughput. The four variants are:
+  - derf:         Derf norm + nnx.MultiHeadAttention (separate Q/K/V projections)
+  - normal:       LayerNorm + nnx.MultiHeadAttention (separate Q/K/V projections)
+  - fused:        Derf norm + combined QKV + jax.nn.dot_product_attention + Pallas kernel
+  - unfused_qkv:  Derf norm + combined QKV + jax.nn.dot_product_attention (no Pallas)
+
+Comparing fused vs unfused_qkv isolates the Pallas kernel effect.
+Comparing unfused_qkv vs derf isolates the architectural effect (combined QKV + DPA).
 
 Usage:
     python benchmarks/benchmark_inference.py --size base
@@ -22,7 +28,7 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from src.models import DerfBert, NormalBert, FusedDerfBert
+from src.models import DerfBert, NormalBert, FusedDerfBert, UnfusedQKVBert
 
 CONFIGS = {
     "base": dict(num_layers=12, dim=768, num_heads=12, mlp_dim=3072),
@@ -33,6 +39,7 @@ MODEL_CLASSES = {
     "derf": DerfBert,
     "normal": NormalBert,
     "fused": FusedDerfBert,
+    "unfused_qkv": UnfusedQKVBert,
 }
 
 
@@ -103,10 +110,10 @@ def benchmark_model(model_type, config, vocab_size, batch_size, seq_len,
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Inference speed benchmark: Derf vs LayerNorm vs Fused"
+        description="Inference speed benchmark: Derf vs LayerNorm vs Fused vs Unfused QKV"
     )
     parser.add_argument("--size", choices=["base", "small"], default="base")
-    parser.add_argument("--models", nargs="+", default=["derf", "normal", "fused"],
+    parser.add_argument("--models", nargs="+", default=["derf", "normal", "fused", "unfused_qkv"],
                         help="Model types to benchmark")
     parser.add_argument("--batch-sizes", nargs="+", type=int, default=[1, 8, 32, 64],
                         help="Batch sizes to test")
@@ -190,18 +197,26 @@ def main():
                 except Exception as e:
                     print(f"  {model_type:>8s} | {batch_size:>5d} | FAILED: {e}")
 
-            # Speedup: fused vs derf (same function, different kernel)
-            fused = [r for r in all_results
-                     if r["model_type"] == "fused"
-                     and r["batch_size"] == batch_size
-                     and r["seq_len"] == seq_len]
-            derf = [r for r in all_results
-                    if r["model_type"] == "derf"
-                    and r["batch_size"] == batch_size
-                    and r["seq_len"] == seq_len]
+            # Speedup comparisons
+            def _get(name):
+                return [r for r in all_results
+                        if r["model_type"] == name
+                        and r["batch_size"] == batch_size
+                        and r["seq_len"] == seq_len]
+
+            fused = _get("fused")
+            derf = _get("derf")
+            unfused_qkv = _get("unfused_qkv")
+
             if fused and derf:
                 speedup = derf[0]["median_ms"] / fused[0]["median_ms"]
                 print(f"  {'':>8s} | {'':>5s} | fused vs derf speedup: {speedup:.2f}x")
+            if unfused_qkv and derf:
+                speedup = derf[0]["median_ms"] / unfused_qkv[0]["median_ms"]
+                print(f"  {'':>8s} | {'':>5s} | unfused_qkv vs derf speedup: {speedup:.2f}x")
+            if fused and unfused_qkv:
+                speedup = unfused_qkv[0]["median_ms"] / fused[0]["median_ms"]
+                print(f"  {'':>8s} | {'':>5s} | fused vs unfused_qkv (kernel only): {speedup:.2f}x")
 
             print()
 

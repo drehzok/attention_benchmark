@@ -13,6 +13,8 @@ from .models import (
     NormalTransformerBlock,
     NormalBert,
     DerfBert,
+    UnfusedQKVTransformerBlock,
+    UnfusedQKVBert,
     FusedTransformerBlock,
     FusedDerfBert,
     BertForSequenceClassification,

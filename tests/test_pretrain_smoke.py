@@ -19,7 +19,7 @@ import optax
 from flax import nnx
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
-from src.models import DerfBert, NormalBert, FusedDerfBert
+from src.models import DerfBert, NormalBert, FusedDerfBert, UnfusedQKVBert
 
 # Small config for smoke test
 CONFIG = dict(num_layers=2, dim=128, num_heads=4, mlp_dim=512)
@@ -142,7 +142,7 @@ def main():
     print(f"Batch:   {batch_size} ({batch_size // num_devices} per device)")
     print()
 
-    models = [("derf", DerfBert), ("normal", NormalBert), ("fused", FusedDerfBert)]
+    models = [("derf", DerfBert), ("normal", NormalBert), ("fused", FusedDerfBert), ("unfused", UnfusedQKVBert)]
     passed = 0
     failed = 0
 

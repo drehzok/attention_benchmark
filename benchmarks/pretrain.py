@@ -3,6 +3,7 @@
 Usage:
     python benchmarks/pretrain.py --model derf --size base
     python benchmarks/pretrain.py --model normal --size small
+    python benchmarks/pretrain.py --model unfused --size base
     python benchmarks/pretrain.py --model both --size base
 
     # Use --no-shard for the fused model on multi-device TPU
@@ -23,7 +24,7 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from src.models import DerfBert, NormalBert, FusedDerfBert
+from src.models import DerfBert, NormalBert, FusedDerfBert, UnfusedQKVBert
 from src.data import get_tokenizer, create_dataset, create_dataloader
 
 CONFIGS = {
@@ -34,7 +35,7 @@ CONFIGS = {
 
 def create_model(model_type, config, vocab_size, dropout_rate, rngs, mesh=None):
     """Instantiate DerfBert, NormalBert, or FusedDerfBert based on model_type string."""
-    cls = {"derf": DerfBert, "normal": NormalBert, "fused": FusedDerfBert}[model_type]
+    cls = {"derf": DerfBert, "normal": NormalBert, "fused": FusedDerfBert, "unfused": UnfusedQKVBert}[model_type]
     kwargs = dict(
         vocab_size=vocab_size,
         num_layers=config["num_layers"],
@@ -341,8 +342,8 @@ def load_resume_checkpoint(model, optimizer, checkpoint_dir, model_type):
 
 def main():
     parser = argparse.ArgumentParser(description="BERT pretraining benchmark: Derf vs LayerNorm")
-    parser.add_argument("--model", choices=["derf", "normal", "fused", "both", "all"], default="both",
-                        help="Which model(s) to train: derf, normal, fused, both (derf+normal), all")
+    parser.add_argument("--model", choices=["derf", "normal", "fused", "unfused", "both", "all"], default="both",
+                        help="Which model(s) to train: derf, normal, fused, unfused, both (derf+normal), all")
     parser.add_argument("--size", choices=["base", "small"], default="base",
                         help="Model size (default: base)")
     parser.add_argument("--steps", type=int, default=10000,
@@ -432,8 +433,9 @@ def main():
         "derf": ["derf"],
         "normal": ["normal"],
         "fused": ["fused"],
+        "unfused": ["unfused"],
         "both": ["derf", "normal"],
-        "all": ["derf", "normal", "fused"],
+        "all": ["derf", "normal", "fused", "unfused"],
     }[args.model]
 
     results = []

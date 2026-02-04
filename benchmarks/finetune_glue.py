@@ -25,7 +25,7 @@ from flax import nnx
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from src.models import (
-    DerfBert, NormalBert, FusedDerfBert, BertForSequenceClassification,
+    DerfBert, NormalBert, FusedDerfBert, UnfusedQKVBert, BertForSequenceClassification,
 )
 from src.data import get_tokenizer, load_glue_task, create_glue_dataloader, GLUE_TASKS
 
@@ -38,6 +38,7 @@ MODEL_CLASSES = {
     "derf": DerfBert,
     "normal": NormalBert,
     "fused": FusedDerfBert,
+    "unfused": UnfusedQKVBert,
 }
 
 

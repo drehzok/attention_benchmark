@@ -3,17 +3,24 @@
 import itertools
 import queue
 import threading
+import time
 
 import jax.numpy as jnp
 import numpy as np
 
+# ---------------------------------------------------------------------------
+# Tokenizer
+# ---------------------------------------------------------------------------
 
 def get_tokenizer(vocab_size=30522):
     """Load bert-base-uncased tokenizer from HuggingFace."""
     from transformers import AutoTokenizer
-
     return AutoTokenizer.from_pretrained("bert-base-uncased")
 
+
+# ---------------------------------------------------------------------------
+# Masked Language Modeling (MLM) Logic
+# ---------------------------------------------------------------------------
 
 def mlm_collate(batch_ids, tokenizer, mlm_prob=0.15, rng=None):
     """Apply BERT-style MLM masking to a batch of token IDs.
@@ -38,11 +45,12 @@ def mlm_collate(batch_ids, tokenizer, mlm_prob=0.15, rng=None):
 
     # Determine which tokens to mask
     prob_matrix = rng.random(batch_ids.shape)
+    
     # Don't mask special tokens (CLS=101, SEP=102, PAD=0)
     special_mask = (batch_ids == tokenizer.cls_token_id) | \
                    (batch_ids == tokenizer.sep_token_id) | \
                    (batch_ids == tokenizer.pad_token_id)
-    prob_matrix[special_mask] = 1.0  # won't be selected
+    prob_matrix[special_mask] = 1.0  # Force prob > 0.15 so they aren't picked
 
     masked_indices = prob_matrix < mlm_prob
     labels[~masked_indices] = -100
@@ -62,27 +70,69 @@ def mlm_collate(batch_ids, tokenizer, mlm_prob=0.15, rng=None):
     return input_ids, labels
 
 
-def create_dataset(tokenizer, seq_len=128, seed=42):
+# ---------------------------------------------------------------------------
+# Dataset Creation (Infinite Streaming + BERT Formatting + GCS)
+# ---------------------------------------------------------------------------
+
+def create_dataset(tokenizer, seq_len=512, seed=42, cache_dir=None):
     """Load Wikipedia + BookCorpusOpen via HuggingFace datasets (streaming).
 
     Tokenizes, concatenates, and chunks into seq_len windows.
-    Returns an iterable yielding np.ndarray of shape (seq_len,).
+    Inserts [CLS] at start and [SEP] at end.
+    
+    Args:
+        tokenizer: HF Tokenizer
+        seq_len: Total sequence length (e.g. 512)
+        seed: Random seed
+        cache_dir: Path to GCS bucket or local dir for caching
+        
+    Returns:
+        an iterable yielding np.ndarray of shape (seq_len,).
     """
     from datasets import load_dataset, interleave_datasets
 
-    wiki = load_dataset("wikimedia/wikipedia", "20231101.en", split="train", streaming=True)
-    books = load_dataset("lucadiliello/bookcorpusopen", split="train", streaming=True)
+    # Define a generator that restarts the dataset when it ends
+    # This prevents the "StopIteration" error after one epoch
+    def infinite_generator():
+        while True:
+            try:
+                # Load datasets with cache_dir to prevent timeouts
+                wiki = load_dataset(
+                    "wikimedia/wikipedia", "20231101.en", 
+                    split="train", 
+                    streaming=True, 
+                    trust_remote_code=True,
+                    cache_dir=cache_dir
+                )
+                books = load_dataset(
+                    "lucadiliello/bookcorpusopen", 
+                    split="train", 
+                    streaming=True, 
+                    trust_remote_code=True,
+                    cache_dir=cache_dir
+                )
 
-    # Extract text field (both have "text")
-    wiki = wiki.remove_columns([c for c in wiki.column_names if c != "text"])
-    books = books.remove_columns([c for c in books.column_names if c != "text"])
+                # Clean columns
+                wiki = wiki.remove_columns([c for c in wiki.column_names if c != "text"])
+                books = books.remove_columns([c for c in books.column_names if c != "text"])
 
-    combined = interleave_datasets([wiki, books], seed=seed)
-    combined = combined.shuffle(seed=seed, buffer_size=10000)
+                # Mix them
+                combined = interleave_datasets([wiki, books], seed=seed)
+                combined = combined.shuffle(seed=seed, buffer_size=10000)
+                
+                yield from combined
+            except Exception as e:
+                print(f"[Dataset Warning] Stream interrupted: {e}. Restarting...")
+                time.sleep(5)
+
+    iterator = infinite_generator()
+    
+    # We need room for [CLS] and [SEP], so actual text length is seq_len - 2
+    block_size = seq_len - 2 
 
     def tokenize_and_chunk():
         buffer = []
-        for example in combined:
+        for example in iterator:
             encoded = tokenizer(
                 example["text"],
                 add_special_tokens=False,
@@ -91,44 +141,50 @@ def create_dataset(tokenizer, seq_len=128, seed=42):
             )["input_ids"]
             buffer.extend(encoded)
 
-            while len(buffer) >= seq_len:
-                yield np.array(buffer[:seq_len], dtype=np.int32)
-                buffer = buffer[seq_len:]
+            while len(buffer) >= block_size:
+                # Extract chunk
+                chunk = buffer[:block_size]
+                buffer = buffer[block_size:]
+
+                # Create [CLS] + chunk + [SEP]
+                input_ids = np.concatenate([
+                    [tokenizer.cls_token_id], 
+                    chunk, 
+                    [tokenizer.sep_token_id]
+                ])
+                
+                # Ensure correct type for JAX
+                yield input_ids.astype(np.int32)
 
     return tokenize_and_chunk()
 
 
+# ---------------------------------------------------------------------------
+# DataLoader (Threaded Prefetch)
+# ---------------------------------------------------------------------------
+
 def create_dataloader(dataset, batch_size, tokenizer, mlm_prob=0.15, seed=42,
                       prefetch=8):
-    """Iterate over dataset, yield JAX arrays of (input_ids, labels).
-
-    Uses a background thread to prefetch batches so data loading overlaps
-    with TPU computation.
-
-    Args:
-        dataset: iterable of np.ndarray chunks (seq_len,)
-        batch_size: number of examples per batch
-        tokenizer: HuggingFace tokenizer for MLM masking
-        mlm_prob: MLM masking probability
-        seed: random seed for masking
-        prefetch: number of batches to prefetch in background
-
-    Yields:
-        (input_ids, labels) as jnp.ndarray of shape (batch_size, seq_len)
-    """
+    """Iterate over dataset, yield JAX arrays of (input_ids, labels)."""
     q = queue.Queue(maxsize=prefetch)
     sentinel = None
 
     def producer():
         rng = np.random.default_rng(seed)
         while True:
+            # Group stream into batches
             batch = list(itertools.islice(dataset, batch_size))
+            
+            # If stream somehow ends (shouldn't happen with infinite generator), break
             if len(batch) < batch_size:
                 break
+                
             batch_ids = np.stack(batch)
             input_ids, labels = mlm_collate(batch_ids, tokenizer,
                                             mlm_prob=mlm_prob, rng=rng)
+            
             q.put((jnp.array(input_ids), jnp.array(labels)))
+            
         q.put(sentinel)
 
     thread = threading.Thread(target=producer, daemon=True)
@@ -152,19 +208,7 @@ GLUE_TASKS = {
 
 
 def load_glue_task(task_name, tokenizer, seq_len=128, split="train"):
-    """Load a GLUE task and return tokenized examples.
-
-    Args:
-        task_name: "sst2" or "mnli"
-        tokenizer: HuggingFace tokenizer
-        seq_len: max sequence length (pad/truncate)
-        split: dataset split ("train", "validation", "validation_matched",
-               "validation_mismatched")
-
-    Returns:
-        input_ids: np.ndarray (num_examples, seq_len)
-        labels: np.ndarray (num_examples,)
-    """
+    """Load a GLUE task and return tokenized examples."""
     from datasets import load_dataset
 
     task_info = GLUE_TASKS[task_name]
@@ -200,18 +244,7 @@ def load_glue_task(task_name, tokenizer, seq_len=128, split="train"):
 
 
 def create_glue_dataloader(input_ids, labels, batch_size, shuffle=True, seed=42):
-    """Yield batches of (input_ids, labels) as JAX arrays.
-
-    Args:
-        input_ids: np.ndarray (num_examples, seq_len)
-        labels: np.ndarray (num_examples,)
-        batch_size: examples per batch
-        shuffle: whether to shuffle each epoch
-        seed: random seed for shuffling
-
-    Yields:
-        (input_ids_batch, labels_batch) as jnp.ndarray
-    """
+    """Yield batches of (input_ids, labels) as JAX arrays."""
     n = len(labels)
     rng = np.random.default_rng(seed)
 

@@ -73,8 +73,9 @@ def make_train_step(model, optimizer):
 
     @nnx.jit
     def train_step(model, optimizer, input_ids, labels, rngs):
+        dropout_key = rngs.dropout()
         def loss_fn(model):
-            logits = model(input_ids, deterministic=False, rngs=rngs)
+            logits = model(input_ids, deterministic=False, rngs=nnx.Rngs(dropout=dropout_key))
             # Cross-entropy loss only on masked positions
             vocab_size = logits.shape[-1]
             log_probs = jax.nn.log_softmax(logits, axis=-1)

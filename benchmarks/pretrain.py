@@ -150,7 +150,18 @@ def train_model(model_type, args, config, tokenizer, mesh, print_prefix=""):
             "losses": [],
         }
 
-    dataset = create_dataset(tokenizer, seq_len=args.seq_len, seed=args.seed)
+    gcs_cache = "gs://attn_checkpoints/hf_cache" 
+
+    print(f"Initializing infinite dataset with GCS cache: {gcs_cache}")
+
+    # 1. Pass the cache_dir
+    # 2. Ensure seq_len matches your model config (usually 512)
+    dataset = create_dataset(
+        tokenizer, 
+        seq_len=args.seq_len, 
+        seed=args.seed,
+        cache_dir=gcs_cache 
+    )
     dataloader = create_dataloader(
         dataset, args.batch_size, tokenizer, mlm_prob=args.mlm_prob, seed=args.seed
     )

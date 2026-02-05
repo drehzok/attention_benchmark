@@ -72,9 +72,9 @@ def make_train_step(model, optimizer):
     """Create a JIT-compiled training step function."""
 
     @nnx.jit
-    def train_step(model, optimizer, input_ids, labels):
+    def train_step(model, optimizer, input_ids, labels, rngs):
         def loss_fn(model):
-            logits = model(input_ids, deterministic=False)
+            logits = model(input_ids, deterministic=False, rngs=rngs)
             # Cross-entropy loss only on masked positions
             vocab_size = logits.shape[-1]
             log_probs = jax.nn.log_softmax(logits, axis=-1)
@@ -108,7 +108,7 @@ def train_model(model_type, args, config, tokenizer, mesh, print_prefix=""):
     replicate = NamedSharding(mesh, P())
     data_shard = NamedSharding(mesh, P('dp'))
 
-    rngs = nnx.Rngs(args.seed)
+    rngs = nnx.Rngs(params=args.seed, dropout=args.seed+1)
     model = create_model(model_type, config, tokenizer.vocab_size, args.dropout, rngs, mesh=mesh)
     n_params = count_params(model)
     print(f"Parameters: {n_params:,}")
@@ -202,7 +202,7 @@ def train_model(model_type, args, config, tokenizer, mesh, print_prefix=""):
         labels = jax.device_put(labels, data_shard)
 
         step_start = time.perf_counter()
-        loss = train_step(model, optimizer, input_ids, labels)
+        loss = train_step(model, optimizer, input_ids, labels, rngs)
         jax.block_until_ready(loss)
         step_elapsed = time.perf_counter() - step_start
 

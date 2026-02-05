@@ -667,8 +667,14 @@ class BertForSequenceClassification(nnx.Module):
         self.dropout = nnx.Dropout(dropout_rate)
         self.classifier = nnx.Linear(bert.dim, num_classes, rngs=rngs)
 
-    def __call__(self, input_ids: jax.Array, mask: jax.Array = None, deterministic: bool = False) -> jax.Array:
-        hidden = self.bert.encode(input_ids, mask, deterministic)
+    def __call__(
+        self, 
+        input_ids: jax.Array, 
+        mask: jax.Array = None, 
+        deterministic: bool = False,
+        rngs: nnx.Rngs = None,
+    ) -> jax.Array:
+        hidden = self.bert.encode(input_ids, mask, deterministic, rngs)
         cls_output = hidden[:, 0, :]
-        cls_output = self.dropout(cls_output, deterministic=deterministic)
+        cls_output = self.dropout(cls_output, deterministic=deterministic, rngs=rngs)
         return self.classifier(cls_output)

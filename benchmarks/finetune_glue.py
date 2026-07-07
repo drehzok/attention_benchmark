@@ -96,7 +96,7 @@ def finetune_one(model_type, args, config, tokenizer, task_info,
     print(f"Fine-tuning {model_type.upper()} on {args.task.upper()}")
     print(f"{'=' * 60}")
 
-    rngs = nnx.Rngs(args.seed)
+    rngs = nnx.Rngs(params=args.seed, dropout=args.seed+1)
     bert = create_bert(model_type, config, tokenizer.vocab_size, args.dropout, rngs)
 
     # Load pretrained checkpoint if provided
@@ -135,9 +135,10 @@ def finetune_one(model_type, args, config, tokenizer, task_info,
     optimizer = nnx.Optimizer(model, tx, wrt=nnx.Param)
 
     @nnx.jit
-    def train_step(model, optimizer, input_ids, labels):
+    def train_step(model, optimizer, input_ids, labels, rngs):
+        dropout_key = rngs.dropout()
         def loss_fn(model):
-            logits = model(input_ids, deterministic=False)
+            logits = model(input_ids, deterministic=False, rngs=nnx.Rngs(dropout=dropout_key))
             return optax.softmax_cross_entropy_with_integer_labels(
                 logits, labels
             ).mean()
@@ -179,7 +180,7 @@ def finetune_one(model_type, args, config, tokenizer, task_info,
             train_ids, train_labels, args.batch_size,
             shuffle=True, seed=args.seed + epoch,
         ):
-            loss = train_step(model, optimizer, batch_x, batch_y)
+            loss = train_step(model, optimizer, batch_x, batch_y, rngs)
             epoch_loss += float(loss)
             epoch_steps += 1
             global_step += 1

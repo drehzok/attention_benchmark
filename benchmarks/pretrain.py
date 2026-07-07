@@ -16,6 +16,8 @@ import os
 import sys
 import time
 
+from etils import epath
+
 import jax
 import jax.numpy as jnp
 import optax
@@ -73,9 +75,10 @@ def make_train_step(model, optimizer):
     """Create a JIT-compiled training step function."""
 
     @nnx.jit
-    def train_step(model, optimizer, input_ids, labels):
+    def train_step(model, optimizer, input_ids, labels, rngs):
+        dropout_key = rngs.dropout()
         def loss_fn(model):
-            logits = model(input_ids, deterministic=False)
+            logits = model(input_ids, deterministic=False, rngs=nnx.Rngs(dropout=dropout_key))
             # Cross-entropy loss only on masked positions
             vocab_size = logits.shape[-1]
             log_probs = jax.nn.log_softmax(logits, axis=-1)
@@ -109,7 +112,7 @@ def train_model(model_type, args, config, tokenizer, mesh, print_prefix=""):
     replicate = NamedSharding(mesh, P())
     data_shard = NamedSharding(mesh, P('dp'))
 
-    rngs = nnx.Rngs(args.seed)
+    rngs = nnx.Rngs(params=args.seed, dropout=args.seed+1)
     model = create_model(model_type, config, tokenizer.vocab_size, args.dropout, rngs, mesh=mesh)
     n_params = count_params(model)
     print(f"Parameters: {n_params:,}")
@@ -150,7 +153,18 @@ def train_model(model_type, args, config, tokenizer, mesh, print_prefix=""):
             "losses": [],
         }
 
-    dataset = create_dataset(tokenizer, seq_len=args.seq_len, seed=args.seed)
+    gcs_cache = "gs://attn_checkpoints/hf_cache" 
+
+    print(f"Initializing infinite dataset with GCS cache: {gcs_cache}")
+
+    # 1. Pass the cache_dir
+    # 2. Ensure seq_len matches your model config (usually 512)
+    dataset = create_dataset(
+        tokenizer, 
+        seq_len=args.seq_len, 
+        seed=args.seed,
+        cache_dir=gcs_cache 
+    )
     dataloader = create_dataloader(
         dataset, args.batch_size, tokenizer, mlm_prob=args.mlm_prob, seed=args.seed
     )
@@ -203,7 +217,7 @@ def train_model(model_type, args, config, tokenizer, mesh, print_prefix=""):
         labels = jax.device_put(labels, data_shard)
 
         step_start = time.perf_counter()
-        loss = train_step(model, optimizer, input_ids, labels)
+        loss = train_step(model, optimizer, input_ids, labels, rngs)
         jax.block_until_ready(loss)
         step_elapsed = time.perf_counter() - step_start
 
@@ -261,18 +275,18 @@ def save_checkpoint(model, optimizer, step, model_type, args):
     try:
         import orbax.checkpoint as ocp
 
-        path = os.path.abspath(os.path.join(args.checkpoint_dir, f"{model_type}_step{step}"))
-        os.makedirs(path, exist_ok=True)
+        # FIX: Use epath to handle 'gs://' correctly
+        base_dir = epath.Path(args.checkpoint_dir)
+        path = base_dir / f"{model_type}_step{step}"
+        path.mkdir(parents=True, exist_ok=True)  # Creates bucket folders if needed
 
         checkpointer = ocp.StandardCheckpointer()
 
-        # Model state (used by finetune_glue.py)
         _, model_state = nnx.split(model)
-        checkpointer.save(os.path.join(path, "state"), model_state)
+        checkpointer.save(path / "state", model_state)
 
-        # Full optimizer state (model params + Adam momentum/variance + LR step counter)
         _, opt_state = nnx.split(optimizer)
-        checkpointer.save(os.path.join(path, "optimizer"), opt_state)
+        checkpointer.save(path / "optimizer", opt_state)
 
         print(f"  Checkpoint saved: {path}")
     except ImportError:
@@ -280,33 +294,39 @@ def save_checkpoint(model, optimizer, step, model_type, args):
 
 
 def _checkpoint_is_valid(checkpoint_path):
-    """Check that a checkpoint dir has finalized data (not just .orbax-checkpoint-tmp)."""
-    if not os.path.isdir(checkpoint_path):
+    """Check that a checkpoint dir has finalized data."""
+    # FIX: Convert string to epath.Path
+    path = epath.Path(checkpoint_path)
+    if not path.exists():
         return False
-    # Valid if it has a finalized 'optimizer' or 'state' subdirectory
-    return (os.path.isdir(os.path.join(checkpoint_path, "optimizer"))
-            or os.path.isdir(os.path.join(checkpoint_path, "state")))
-
+    # Check for subdirectories
+    return (path / "optimizer").exists() or (path / "state").exists()
 
 def find_latest_checkpoint(checkpoint_dir, model_type):
-    """Find the latest valid checkpoint step for a model type. Returns step or None."""
+    """Find the latest valid checkpoint step for a model type."""
     import re
-    checkpoint_dir = os.path.abspath(checkpoint_dir)
-    if not os.path.isdir(checkpoint_dir):
+    
+    # FIX: Use epath for listing files in bucket
+    ckpt_dir = epath.Path(checkpoint_dir)
+    if not ckpt_dir.exists():
         return None
+
     pattern = re.compile(rf"^{re.escape(model_type)}_step(\d+)$")
     steps = []
-    for name in os.listdir(checkpoint_dir):
-        m = pattern.match(name)
-        if m:
-            steps.append(int(m.group(1)))
-    # Check from newest to oldest, return first valid one
+
+    # FIX: Use .iterdir() instead of os.listdir()
+    for path in ckpt_dir.iterdir():
+        if path.is_dir():
+            m = pattern.match(path.name)
+            if m:
+                steps.append(int(m.group(1)))
+
     for step in sorted(steps, reverse=True):
-        path = os.path.join(checkpoint_dir, f"{model_type}_step{step}")
-        if _checkpoint_is_valid(path):
+        full_path = ckpt_dir / f"{model_type}_step{step}"
+        if _checkpoint_is_valid(full_path):
             return step
         else:
-            print(f"  Skipping incomplete checkpoint: {path}")
+            print(f"  Skipping incomplete checkpoint: {full_path}")
     return None
 
 

@@ -256,19 +256,24 @@ class NormalTransformerBlock(nnx.Module):
             decode=False,
             rngs=rngs,
         )
-        self.dropout1 = nnx.Dropout(dropout_rate, rngs=rngs)
+        self.dropout1 = nnx.Dropout(dropout_rate)
 
         self.norm2 = nnx.LayerNorm(dim, rngs=rngs)
         self.mlp_fc1 = nnx.Linear(dim, mlp_dim, rngs=rngs)
         self.mlp_fc2 = nnx.Linear(mlp_dim, dim, rngs=rngs)
-        self.dropout2 = nnx.Dropout(dropout_rate, rngs=rngs)
+        self.dropout2 = nnx.Dropout(dropout_rate)
 
-    def __call__(self, x: jax.Array, mask: jax.Array, deterministic: bool = False) -> jax.Array:
+    def __call__(
+        self, x: jax.Array, 
+        mask: jax.Array, 
+        deterministic: bool = True, 
+        rngs:nnx.Rngs = None
+    ) -> jax.Array:
         resid = x
 
         x = self.norm1(x)
         x = self.attn(x, mask=mask)
-        x = self.dropout1(x, deterministic=deterministic)
+        x = self.dropout1(x, deterministic=deterministic, rngs=rngs)
         x = resid + x
 
         resid = x
@@ -277,7 +282,7 @@ class NormalTransformerBlock(nnx.Module):
         x = self.mlp_fc1(x)
         x = jax.nn.gelu(x)
         x = self.mlp_fc2(x)
-        x = self.dropout2(x, deterministic=deterministic)
+        x = self.dropout2(x, deterministic=deterministic, rngs=rngs)
         x = resid + x
 
         return x
@@ -311,16 +316,28 @@ class NormalBert(nnx.Module):
 
         self.head = nnx.Linear(dim, vocab_size, rngs=rngs)
 
-    def encode(self, input_ids: jax.Array, mask: jax.Array = None, deterministic: bool = False) -> jax.Array:
+    def encode(
+        self, 
+        input_ids: jax.Array, 
+        mask: jax.Array = None, 
+        deterministic: bool = True, 
+        rngs:nnx.Rngs = None
+    ) -> jax.Array:
         seq_len = input_ids.shape[1]
         pos_ids = jnp.arange(seq_len)[None, :]
         x = self.embed(input_ids) + self.pos_embed(pos_ids)
         for layer in self.layers:
-            x = layer(x, mask, deterministic=deterministic)
+            x = layer(x, mask, deterministic=deterministic, rngs=rngs)
         return self.final_norm(x)
 
-    def __call__(self, input_ids: jax.Array, mask: jax.Array = None, deterministic: bool = False) -> jax.Array:
-        return self.head(self.encode(input_ids, mask, deterministic))
+    def __call__(
+        self, 
+        input_ids: jax.Array, 
+        mask: jax.Array = None, 
+        deterministic: bool = True, 
+        rngs:nnx.Rngs = None
+    ) -> jax.Array:
+        return self.head(self.encode(input_ids, mask, deterministic, rngs))
 
 
 class DerfBert(nnx.Module):
@@ -349,7 +366,13 @@ class DerfBert(nnx.Module):
 
         self.head = nnx.Linear(dim, vocab_size, rngs=rngs)
 
-    def encode(self, input_ids: jax.Array, mask: jax.Array = None, deterministic: bool = False) -> jax.Array:
+    def encode(
+        self, 
+        input_ids: jax.Array, 
+        mask: jax.Array = None, 
+        deterministic: bool = False,
+        rngs: nnx.Rngs = None,
+    ) -> jax.Array:
         seq_len = input_ids.shape[1]
         pos_ids = jnp.arange(seq_len)[None, :]
         x = self.embed(input_ids) + self.pos_embed(pos_ids)
@@ -357,7 +380,13 @@ class DerfBert(nnx.Module):
             x = layer(x, mask, deterministic=deterministic)
         return self.final_norm(x)
 
-    def __call__(self, input_ids: jax.Array, mask: jax.Array = None, deterministic: bool = False) -> jax.Array:
+    def __call__(
+        self, 
+        input_ids: jax.Array, 
+        mask: jax.Array = None, 
+        deterministic: bool = False,
+        rngs: nnx.Rngs = None,
+    ) -> jax.Array:
         return self.head(self.encode(input_ids, mask, deterministic))
 
 
@@ -380,15 +409,21 @@ class UnfusedQKVTransformerBlock(nnx.Module):
         self.norm1 = Derf(dim, rngs)
         self.w_qkv = nnx.Linear(dim, 3 * dim, rngs=rngs)
         self.w_o = nnx.Linear(dim, dim, rngs=rngs)
-        self.dropout1 = nnx.Dropout(dropout_rate, rngs=rngs)
+        self.dropout1 = nnx.Dropout(dropout_rate)
 
         # MLP path
         self.norm2 = Derf(dim, rngs)
         self.mlp_fc1 = nnx.Linear(dim, mlp_dim, rngs=rngs)
         self.mlp_fc2 = nnx.Linear(mlp_dim, dim, rngs=rngs)
-        self.dropout2 = nnx.Dropout(dropout_rate, rngs=rngs)
+        self.dropout2 = nnx.Dropout(dropout_rate)
 
-    def __call__(self, x: jax.Array, mask: jax.Array = None, deterministic: bool = False) -> jax.Array:
+    def __call__(
+        self, 
+        x: jax.Array, 
+        mask: jax.Array = None, 
+        deterministic: bool = True, 
+        rngs: nnx.Rngs = None
+    ) -> jax.Array:
         batch, seq_len, dim = x.shape
         resid = x
 
@@ -401,7 +436,7 @@ class UnfusedQKVTransformerBlock(nnx.Module):
         attn_out = jax.nn.dot_product_attention(q, k, v, mask=mask)
         attn_out = attn_out.reshape(batch, seq_len, dim)
 
-        x = resid + self.dropout1(self.w_o(attn_out), deterministic=deterministic)
+        x = resid + self.dropout1(self.w_o(attn_out), deterministic=deterministic, rngs=rngs)
 
         # Separate Derf + fc1 (no Pallas fusion)
         resid = x
@@ -409,7 +444,7 @@ class UnfusedQKVTransformerBlock(nnx.Module):
         hidden = self.mlp_fc1(hidden)
         hidden = jax.nn.gelu(hidden)
         hidden = self.mlp_fc2(hidden)
-        x = resid + self.dropout2(hidden, deterministic=deterministic)
+        x = resid + self.dropout2(hidden, deterministic=deterministic, rngs=rngs)
 
         return x
 
@@ -446,16 +481,28 @@ class UnfusedQKVBert(nnx.Module):
 
         self.head = nnx.Linear(dim, vocab_size, rngs=rngs)
 
-    def encode(self, input_ids: jax.Array, mask: jax.Array = None, deterministic: bool = False) -> jax.Array:
+    def encode(
+        self, 
+        input_ids: jax.Array, 
+        mask: jax.Array = None, 
+        deterministic: bool = True, 
+        rngs: nnx.Rngs = None
+    ) -> jax.Array:
         seq_len = input_ids.shape[1]
         pos_ids = jnp.arange(seq_len)[None, :]
         x = self.embed(input_ids) + self.pos_embed(pos_ids)
         for layer in self.layers:
-            x = layer(x, mask, deterministic=deterministic)
+            x = layer(x, mask, deterministic=deterministic, rngs=rngs)
         return self.final_norm(x)
 
-    def __call__(self, input_ids: jax.Array, mask: jax.Array = None, deterministic: bool = False) -> jax.Array:
-        return self.head(self.encode(input_ids, mask, deterministic))
+    def __call__(
+        self, 
+        input_ids: jax.Array, 
+        mask: jax.Array = None, 
+        deterministic: bool = True, 
+        rngs: nnx.Rngs = None
+    ) -> jax.Array:
+        return self.head(self.encode(input_ids, mask, deterministic, rngs))
 
 
 # ---------------------------------------------------------------------------
@@ -624,8 +671,14 @@ class BertForSequenceClassification(nnx.Module):
         self.dropout = nnx.Dropout(dropout_rate)
         self.classifier = nnx.Linear(bert.dim, num_classes, rngs=rngs)
 
-    def __call__(self, input_ids: jax.Array, mask: jax.Array = None, deterministic: bool = False) -> jax.Array:
-        hidden = self.bert.encode(input_ids, mask, deterministic)
+    def __call__(
+        self, 
+        input_ids: jax.Array, 
+        mask: jax.Array = None, 
+        deterministic: bool = False,
+        rngs: nnx.Rngs = None,
+    ) -> jax.Array:
+        hidden = self.bert.encode(input_ids, mask, deterministic, rngs)
         cls_output = hidden[:, 0, :]
-        cls_output = self.dropout(cls_output, deterministic=deterministic)
+        cls_output = self.dropout(cls_output, deterministic=deterministic, rngs=rngs)
         return self.classifier(cls_output)

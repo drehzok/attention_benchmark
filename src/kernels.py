@@ -13,6 +13,7 @@ Public API:
 """
 
 import functools
+import logging
 
 import jax
 import jax.numpy as jnp
@@ -124,6 +125,10 @@ def pallas_matmul(x, weight, bias):
     if _can_use_pallas(M, K, N):
         out_2d = _pallas_matmul_2d(x_2d, weight) + bias
     else:
+        logging.warning(
+            f"pallas_matmul silent fallback to JAX. "
+            f"Shapes M={M}, K={K}, N={N} not multiples of 128."
+        )
         out_2d = _matmul_ref(x_2d, weight, bias)
 
     return out_2d.reshape(*leading, N)
@@ -331,6 +336,10 @@ def _forward_impl(x, weight, bias, alpha, s, gamma, beta):
     if _can_use_pallas(M, K, N):
         out_2d = _pallas_forward(x_2d, weight, bias, alpha, s, gamma, beta)
     else:
+        logging.warning(
+            f"fused_derf_linear silent fallback to JAX. "
+            f"Shapes M={M}, K={K}, N={N} not multiples of 128."
+        )
         out_2d = _derf_linear_ref(x_2d, weight, bias, alpha, s, gamma, beta)
 
     return out_2d.reshape(*leading, N)
@@ -369,10 +378,11 @@ def _fwd(x, weight, bias, alpha, s, gamma, beta):
 def _bwd(res, g):
     x, weight, alpha, s, gamma, beta = res
 
-    # Recompute intermediates (cheaper than saving from forward).
+    # Recompute intermediates matching the forward approximation.
     u = alpha * x + s
-    erf_u = lax.erf(u)
-    normed = gamma * erf_u + beta                                # (..., K)
+    inner = _TWO_OVER_SQRT_PI * (u + _ERF_COEFF * u * u * u)
+    erf_approx = lax.tanh(inner)
+    normed = gamma * erf_approx + beta                                # (..., K)
 
     leading = x.shape[:-1]
     K = x.shape[-1]
@@ -394,11 +404,12 @@ def _bwd(res, g):
     # d(output)/d(normed) = g @ weight^T
     d_normed = (g_2d @ weight.T).reshape(x.shape)                # (..., K)
 
-    # erf'(u) = 2/sqrt(pi) * exp(-u^2)
-    erf_deriv = (2.0 / jnp.sqrt(jnp.pi)) * jnp.exp(-(u * u))
+    # erf'(u) approximation derivative:
+    # d(tanh(inner))/du = (1 - tanh^2(inner)) * d(inner)/du
+    erf_deriv = (1.0 - erf_approx * erf_approx) * _TWO_OVER_SQRT_PI * (1.0 + 3.0 * _ERF_COEFF * u * u)
 
     reduce_axes = tuple(range(len(leading)))
-    d_gamma = (d_normed * erf_u).sum(axis=reduce_axes)           # (K,)
+    d_gamma = (d_normed * erf_approx).sum(axis=reduce_axes)           # (K,)
     d_beta  = d_normed.sum(axis=reduce_axes)                     # (K,)
     d_x     = d_normed * gamma * erf_deriv * alpha               # (..., K)
     d_alpha = (d_normed * gamma * erf_deriv * x).sum()           # scalar

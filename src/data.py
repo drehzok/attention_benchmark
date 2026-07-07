@@ -91,9 +91,10 @@ def create_dataset(tokenizer, seq_len=128, seed=42):
             )["input_ids"]
             buffer.extend(encoded)
 
-            while len(buffer) >= seq_len:
-                yield np.array(buffer[:seq_len], dtype=np.int32)
-                buffer = buffer[seq_len:]
+            while len(buffer) >= seq_len - 2:
+                chunk = [tokenizer.cls_token_id] + buffer[:seq_len - 2] + [tokenizer.sep_token_id]
+                yield np.array(chunk, dtype=np.int32)
+                buffer = buffer[seq_len - 2:]
 
     return tokenize_and_chunk()
 

@@ -295,12 +295,13 @@ class NormalBert(nnx.Module):
         mlp_dim: int,
         dropout_rate: float,
         rngs: nnx.Rngs,
+        max_position_embeddings: int = 512,
     ):
         self.dim = dim
         self.num_layers = num_layers
 
         self.embed = nnx.Embed(vocab_size, dim, rngs=rngs)
-        self.pos_embed = nnx.Embed(512, dim, rngs=rngs)
+        self.pos_embed = nnx.Embed(max_position_embeddings, dim, rngs=rngs)
         self.final_norm = nnx.LayerNorm(dim, rngs=rngs)
 
         self.layers = nnx.List([
@@ -332,12 +333,13 @@ class DerfBert(nnx.Module):
         mlp_dim: int,
         dropout_rate: float,
         rngs: nnx.Rngs,
+        max_position_embeddings: int = 512,
     ):
         self.dim = dim
         self.num_layers = num_layers
 
         self.embed = nnx.Embed(vocab_size, dim, rngs=rngs)
-        self.pos_embed = nnx.Embed(512, dim, rngs=rngs)
+        self.pos_embed = nnx.Embed(max_position_embeddings, dim, rngs=rngs)
         self.final_norm = Derf(dim, rngs)
 
         self.layers = nnx.List([
@@ -428,12 +430,13 @@ class UnfusedQKVBert(nnx.Module):
         mlp_dim: int,
         dropout_rate: float,
         rngs: nnx.Rngs,
+        max_position_embeddings: int = 512,
     ):
         self.dim = dim
         self.num_layers = num_layers
 
         self.embed = nnx.Embed(vocab_size, dim, rngs=rngs)
-        self.pos_embed = nnx.Embed(512, dim, rngs=rngs)
+        self.pos_embed = nnx.Embed(max_position_embeddings, dim, rngs=rngs)
         self.final_norm = Derf(dim, rngs)
 
         self.layers = nnx.List([
@@ -578,13 +581,14 @@ class FusedDerfBert(nnx.Module):
         mlp_dim: int,
         dropout_rate: float,
         rngs: nnx.Rngs,
+        max_position_embeddings: int = 512,
         mesh=None,
     ):
         self.dim = dim
         self.num_layers = num_layers
 
         self.embed = nnx.Embed(vocab_size, dim, rngs=rngs)
-        self.pos_embed = nnx.Embed(512, dim, rngs=rngs)
+        self.pos_embed = nnx.Embed(max_position_embeddings, dim, rngs=rngs)
         self.final_norm = Derf(dim, rngs)
 
         self.layers = nnx.List([

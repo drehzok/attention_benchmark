@@ -43,6 +43,7 @@ def create_model(model_type, config, vocab_size, dropout_rate, rngs, mesh=None):
         num_heads=config["num_heads"],
         mlp_dim=config["mlp_dim"],
         dropout_rate=dropout_rate,
+        max_position_embeddings=config.get("max_position_embeddings", 512),
         rngs=rngs,
     )
     if model_type == "fused":

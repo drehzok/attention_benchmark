@@ -143,7 +143,7 @@ def reference(x, w, alpha):
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
-def test_approach(name, fn):
+def run_approach_checks(name, fn):
     print("=" * 60)
     print(f"TEST: {name}")
     print("=" * 60)
@@ -188,8 +188,8 @@ def main():
     print()
 
     results = [
-        ("A: scalar_prefetch (SMEM)",     test_approach("A: scalar_prefetch", scalar_prefetch_matmul)),
-        ("B: BlockSpec broadcast (1,1)",   test_approach("B: BlockSpec (1,1)", blockspec_scalar_matmul)),
+        ("A: scalar_prefetch (SMEM)",     run_approach_checks("A: scalar_prefetch", scalar_prefetch_matmul)),
+        ("B: BlockSpec broadcast (1,1)",   run_approach_checks("B: BlockSpec (1,1)", blockspec_scalar_matmul)),
     ]
 
     print()

@@ -61,7 +61,7 @@ def make_train_step():
     return train_step
 
 
-def test_model(model_type, cls, mesh, replicate, data_shard, batch_size):
+def run_model_checks(model_type, cls, mesh, replicate, data_shard, batch_size):
     """Run all checks for one model type. Returns (passed: bool, message: str)."""
     kwargs = dict(
         vocab_size=VOCAB_SIZE,
@@ -148,7 +148,7 @@ def main():
 
     for model_type, cls in models:
         try:
-            ok, msg = test_model(
+            ok, msg = run_model_checks(
                 model_type, cls, mesh, replicate, data_shard, batch_size
             )
             print(f"  {model_type:>8s}: PASS  {msg}")

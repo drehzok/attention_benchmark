@@ -204,7 +204,11 @@ def test_fused_derf_linear_gradient():
         return fused_derf_linear(x, w, b, a, s_, g, bt).sum()
 
     def loss_ref(x, w, b, a, s_, g, bt):
-        normed = g * jax.lax.erf(a * x + s_) + bt
+        u = a * x + s_
+        _TWO_OVER_SQRT_PI = 1.1283791670955126
+        _ERF_COEFF = 0.08943
+        erf_approx = jax.lax.tanh(_TWO_OVER_SQRT_PI * (u + _ERF_COEFF * u * u * u))
+        normed = g * erf_approx + bt
         return (normed @ w + b).sum()
 
     grads_fused = jax.grad(loss_fused, argnums=(0, 1, 2, 3, 4, 5, 6))(
